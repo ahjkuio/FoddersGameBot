@@ -16,4 +16,4 @@ RUN pip install --upgrade pip && \
 COPY . .
 
 # Команда запуска
-CMD ["python", "-m", "telegram_videogame_bot.main"] 
+CMD ["python", "telegram_videogame_bot/main.py"] 

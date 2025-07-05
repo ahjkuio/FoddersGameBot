@@ -15,5 +15,8 @@ RUN pip install --upgrade pip && \
 # Копируем исходники
 COPY . .
 
+# Переходим внутрь директории бота
+WORKDIR /app/telegram_videogame_bot
+
 # Команда запуска
-CMD ["python", "telegram_videogame_bot/main.py"] 
+CMD ["python", "main.py"] 

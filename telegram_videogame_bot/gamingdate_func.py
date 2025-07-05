@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiosqlite
 import logging
 
-DATABASE_URL = 'personalAk_database.db'
+DATABASE_URL = 'seed/personalAk_database.db'
 
 async def find_potential_friends(user_data, viewed_users):
     user_id, username, gender, age, city, photos, favorite_games, description, profile_link, display_status, preferred_gender, likes = user_data

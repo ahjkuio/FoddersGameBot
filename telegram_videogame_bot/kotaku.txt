@@ -1,0 +1,16 @@
+719117543	Никита	Мужской	21	Новосибирск	AgACAgIAAxkBAAIIZmZwYx3mtlfBQSJI_8DigQ8i5IstAAK41zEb9WqAS7J9qZ18OGEdAQADAgADcwADNQQ	The last of us, Total war, Fortnite	Активно ищу игроков в пати	@nikita_pyatnitskiy	нет
+
+449066726	Тема🏃/ Fodderxd🎮	Мужской	21	Санкт-Петербург	AgACAgIAAxkBAAILF2ZwvxQI5gaqNtjGox_SGZa7cEPUAAJH4jEbDWOIS6td-EkZ01y3AQADAgADeQADNQQ,AgACAgIAAxkBAAILGGZwvxS8qYpr_QP_Xy7xQcErpAxvAAJI4jEbDWOIS7PSqxM4H0tLAQADAgADeQADNQQ	Sonic the Hedgehog, Super Mario Bros, Pizza Tower	зз - волк. 
+Прогаммистер. Покупаю виниловые пластинки, кассеты, а еще коллекционирую видеоигры. Если точнее: меломан лютый, а игры именно ретроигры (Марио, Соник, Зельда и т.п.).
+Так что со мной можно обсудить музыку и игрушки) Да в принципе все медиа пространство.
+Человек я общительный, эмпат и просто мега добрый 🦭	@sonicsuperhedgehog	да
+
+
+profile_text = (
+        f"Имя: {profile[1]}\n"
+        f"Возраст: {profile[3]}\n"
+        f"Гендер: {profile[2]}\n"
+        f"Город: {profile[4]}\n"
+        f"Игры: {profile[6]}\n"
+        f"Описание: {profile[7]}\n"
+    )

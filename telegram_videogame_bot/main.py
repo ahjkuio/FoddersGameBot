@@ -23,25 +23,21 @@ from personalAccount_keyboards import (
     confirm_profile_keyboard, edit_profile_keyboard
 )
 from gamingdate_handlers import register_handlers_gamingdate
+import logging_config
+from loguru import logger
+from routers import base as base_router, media as media_router, hotline as hotline_router, gmdata as gmdata_router, store as store_router
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Установка уровня логирования для других модулей
-logging.getLogger('asyncio').setLevel(logging.ERROR)
-logging.getLogger('aiogram').setLevel(logging.ERROR)
+# Настройка Loguru
+logging_config.configure_logging()
 
 # Инициализация бота и диспетчера
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+dp.include_router(base_router.router)
+dp.include_router(media_router.router)
+dp.include_router(hotline_router.router)
+dp.include_router(gmdata_router.router)
+dp.include_router(store_router.router)
 
 # Состояния личного кабинета
 from aiogram.filters.state import State, StatesGroup
@@ -116,13 +112,10 @@ async def check_lk_command(message: types.Message, state: FSMContext):
 # Регистрация команд
 # -------------------------------------
 
-dp.message.register(check_start_command, Command('start'))
-dp.message.register(check_main_menu_command, Command('menu'))
-dp.message.register(check_help_command, Command('help'))
-dp.message.register(check_media_command, Command('media'))
-dp.message.register(check_hotline_command, Command('hotline'))
-dp.message.register(check_store_command, Command('stores'))
-dp.message.register(check_gmdata_command, Command('gmdata'))
+# dp.message.register(check_media_command, Command('media'))
+# dp.message.register(check_hotline_command, Command('hotline'))
+# dp.message.register(check_store_command, Command('stores'))
+# dp.message.register(check_gmdata_command, Command('gmdata'))
 dp.message.register(check_gamingdate_command, Command('gmdate'))
 dp.message.register(check_lk_command, Command('lk'))
 
@@ -130,7 +123,7 @@ dp.message.register(check_lk_command, Command('lk'))
 from base_keyboards import reply_menu_keyboard
 
 dp.message.register(check_main_menu_command, lambda m: m.text == "Меню")
-dp.message.register(check_hotline_command, lambda m: m.text == "Тех. Поддержка")
+# dp.message.register(check_hotline_command, lambda m: m.text == "Тех. Поддержка")
 dp.message.register(check_lk_command, lambda m: m.text == "Личный Кабинет")
 dp.message.register(check_help_command, lambda m: m.text == "Настройки")
 
@@ -138,35 +131,35 @@ dp.message.register(check_help_command, lambda m: m.text == "Настройки"
 # Callback Query регистрации
 # -------------------------------------
 
-dp.callback_query.register(base_handlers.cmd_help, lambda c: c.data == 'show_commands')
-dp.callback_query.register(media_handlers.cmd_media, lambda c: c.data == 'choice_media')
-dp.callback_query.register(hotline_handlers.cmd_hotline, lambda c: c.data == 'call_hotline')
-dp.callback_query.register(store_handlers.cmd_stores, lambda c: c.data == 'choice_store')
-dp.callback_query.register(gmdata_handlers.cmd_gmdata, lambda c: c.data == 'call_gmdata')
+# dp.callback_query.register(base_handlers.cmd_help, lambda c: c.data == 'show_commands')
+# dp.callback_query.register(media_handlers.cmd_media, lambda c: c.data == 'choice_media')
+# dp.callback_query.register(hotline_handlers.cmd_hotline, lambda c: c.data == 'call_hotline')
+# dp.callback_query.register(store_handlers.cmd_stores, lambda c: c.data == 'choice_store')
+# dp.callback_query.register(gmdata_handlers.cmd_gmdata, lambda c: c.data == 'call_gmdata')
 dp.callback_query.register(gamingdate_handlers.cmd_gmdate, lambda c: c.data == 'call_gamingdate')
-dp.callback_query.register(check_lk_command, lambda c: c.data == 'personal_account')
-dp.callback_query.register(base_handlers.cmd_main_menu, lambda c: c.data == 'main_menu')
+# dp.callback_query.register(check_lk_command, lambda c: c.data == 'personal_account')
+# dp.callback_query.register(base_handlers.cmd_main_menu, lambda c: c.data == 'main_menu')
 
 # media
 
-dp.callback_query.register(media_handlers.process_choice_media, lambda c: c.data.startswith('media_choice:'))
-dp.callback_query.register(media_handlers.process_site_choice, lambda c: c.data.startswith('site_choice:'))
-dp.callback_query.register(media_handlers.process_channel_choice, lambda c: c.data.startswith('channel_choice:'))
-dp.callback_query.register(media_handlers.process_communitie_choise, lambda c: c.data.startswith('communitie_choice'))
-dp.callback_query.register(media_handlers.process_choice_media, lambda c: c.data == 'media_choice:back')
+# dp.callback_query.register(media_handlers.process_choice_media, lambda c: c.data.startswith('media_choice:'))
+# dp.callback_query.register(media_handlers.process_site_choice, lambda c: c.data.startswith('site_choice:'))
+# dp.callback_query.register(media_handlers.process_channel_choice, lambda c: c.data.startswith('channel_choice:'))
+# dp.callback_query.register(media_handlers.process_communitie_choise, lambda c: c.data.startswith('communitie_choice'))
+# dp.callback_query.register(media_handlers.process_choice_media, lambda c: c.data == 'media_choice:back')
 
 # store
 
-dp.callback_query.register(store_handlers.process_store_choice, lambda c: c.data.startswith('store:'))
-dp.callback_query.register(store_handlers.process_steam_option, lambda c: c.data.startswith('steam:'))
-dp.message.register(store_handlers.process_search_query, store_handlers.SteamStates.search_query)
-dp.callback_query.register(store_handlers.process_sort_option, lambda c: c.data.startswith('sort:'))
-dp.callback_query.register(store_handlers.process_store_choice, lambda c: c.data.startswith('store:back'))
+# dp.callback_query.register(store_handlers.process_store_choice, lambda c: c.data.startswith('store:'))
+# dp.callback_query.register(store_handlers.process_steam_option, lambda c: c.data.startswith('steam:'))
+# dp.message.register(store_handlers.process_search_query, store_handlers.SteamStates.search_query)
+# dp.callback_query.register(store_handlers.process_sort_option, lambda c: c.data.startswith('sort:'))
+# dp.callback_query.register(store_handlers.process_store_choice, lambda c: c.data.startswith('store:back'))
 
-dp.callback_query.register(store_handlers.process_page, lambda c: c.data.startswith("page:"))
-dp.callback_query.register(store_handlers.process_game_info, lambda c: c.data.startswith("game_info:"))
-dp.callback_query.register(store_handlers.toggle_favorite, lambda c: c.data.startswith("toggle_favorite:"))
-dp.callback_query.register(store_handlers.toggle_notifications, lambda c: c.data.startswith("toggle_notifications:"))
+# dp.callback_query.register(store_handlers.process_page, lambda c: c.data.startswith("page:"))
+# dp.callback_query.register(store_handlers.process_game_info, lambda c: c.data.startswith("game_info:"))
+# dp.callback_query.register(store_handlers.toggle_favorite, lambda c: c.data.startswith("toggle_favorite:"))
+# dp.callback_query.register(store_handlers.toggle_notifications, lambda c: c.data.startswith("toggle_notifications:"))
 
 # Регистрация обработчиков GamingDate
 register_handlers_gamingdate(dp)

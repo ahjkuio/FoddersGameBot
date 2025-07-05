@@ -1,8 +1,10 @@
 import os
 import aiosqlite
+import pathlib
 
 # Используем volume Railway (или локальный файл) через переменную окружения
-DATABASE_URL = os.getenv('DB_PATH', '/app/telegram_videogame_bot/seed/personalAk_database.db')
+base_dir = pathlib.Path(__file__).resolve().parent.parent  # ← на каталог проекта
+default_db = base_dir / "seed" / "personalAk_database.db"
 
 async def init_db():
     async with aiosqlite.connect(DATABASE_URL) as db:

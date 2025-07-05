@@ -12,7 +12,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Копируем исходники
+# Копируем все исходники, включая seed
 COPY . .
 
 # Переходим внутрь директории бота

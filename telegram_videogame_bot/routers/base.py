@@ -5,8 +5,10 @@ from aiogram.fsm.context import FSMContext
 import utils
 import base_handlers
 import personalAccount_handlers
+from . import prices as prices_router
 
 router = Router()
+router.include_router(prices_router.router)
 
 
 @router.message(Command("start"))
@@ -53,4 +55,10 @@ async def back_to_main_menu(call: types.CallbackQuery):
 # Краткое содержание – показывает /help
 @router.callback_query(lambda c: c.data == 'show_commands')
 async def show_commands(call: types.CallbackQuery):
-    await base_handlers.cmd_help(call) 
+    await base_handlers.cmd_help(call)
+
+
+@router.callback_query(lambda c: c.data == 'call_prices')
+async def show_prices_cmd(callback: types.CallbackQuery, state: FSMContext):
+    await prices_router.cmd_prices(callback.message, state)
+    await callback.answer() 

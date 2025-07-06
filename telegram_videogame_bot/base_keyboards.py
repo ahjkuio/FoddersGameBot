@@ -24,8 +24,9 @@ inline_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🦮Гид-Экскурсии по Играм🦮 !В разработке!", callback_data="choice_guide_game")],
     [InlineKeyboardButton(text="🔧Тех. поддержка🔧", callback_data="call_hotline")],
     [InlineKeyboardButton(text="✔️Подписка✔️ !В разработке!", callback_data="choice_sub")],
-    [InlineKeyboardButton(text="🎴Личный Кабинет🎴", callback_data="personal_account")]
-     ])
+    [InlineKeyboardButton(text="🎴Личный Кабинет🎴", callback_data="personal_account")],
+    [InlineKeyboardButton(text="💸 Сравнить цены", callback_data="call_prices")],
+])
 
 inline_main_menu_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Вернуться в Меню", callback_data="main_menu")]])

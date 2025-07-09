@@ -1,10 +1,19 @@
 import asyncio
 import logging
+import sys
+from pathlib import Path
+
+# Добавляем корневую папку проекта в sys.path
+# Это нужно, чтобы работали абсолютные импорты из любой точки проекта
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
 
 from aiogram import types, Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import ContentType
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 
 # Импорт наших внутренних модулей
 import base_handlers

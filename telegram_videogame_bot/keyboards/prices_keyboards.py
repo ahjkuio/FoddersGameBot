@@ -1,6 +1,7 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 import math
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 GAMES_PER_PAGE = 15
 
@@ -25,8 +26,7 @@ def build_games_keyboard(game_groups: list, page: int = 0) -> InlineKeyboardMark
             pagination_buttons.append(InlineKeyboardButton(text="Вперёд »", callback_data=f"price_page_{page + 1}"))
         builder.row(*pagination_buttons)
 
-    builder.row(InlineKeyboardButton(text="↩️ Назад", callback_data="price_back"))
-    builder.row(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(text="↩️ Назад в меню", callback_data="main_menu"))
     return builder.as_markup()
 
 def back_to_games_list_keyboard() -> InlineKeyboardMarkup:
@@ -36,17 +36,10 @@ def back_to_games_list_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 def offers_keyboard(game_id_idx: str):
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="↩️ Назад к списку", callback_data="price_back"))
-    builder.row(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
-    return builder.as_markup()
+    return back_to_games_list_keyboard()
 
 def cancel_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="↩️ Назад", callback_data="price_back"))
-    builder.row(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
-    return builder.as_markup()
+    return InlineKeyboardBuilder().row(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")).as_markup()
 
 # --- Платформы и Регионы ---
 
@@ -65,10 +58,6 @@ REGIONS = [
     ("AR", "🇦🇷 Аргентина"),
     ("BR", "🇧🇷 Бразилия"),
     ("US", "🇺🇸 США"),
-    ("IN", "🇮🇳 Индия"),
-    ("UA", "🇺🇦 Украина"),
-    ("KZ", "🇰🇿 Казахстан"),
-    ("PL", "🇵🇱 Польша"),
 ]
 
 def build_platform_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
@@ -104,15 +93,4 @@ def build_regions_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
         builder.row(InlineKeyboardButton(text="✔️ Далее", callback_data="region_ok"))
 
     builder.row(InlineKeyboardButton(text="↩️ Назад", callback_data="price_back"))
-    return builder.as_markup()
-
-# --- Старые версии для обратной совместимости (пока) ---
-
-def games_keyboard(games):
-    return build_games_keyboard({gid: name for gid, name in games})
-
-def platforms_keyboard(selected: set[str]):
-    return build_platform_keyboard(selected)
-
-def regions_keyboard(selected: set[str]):
-    return build_regions_keyboard(selected) 
+    return builder.as_markup() 

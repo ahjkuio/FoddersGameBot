@@ -16,7 +16,7 @@ HEADERS = {
 }
 
 
-async def search_games(query: str, limit: int = 5) -> List[Tuple[str, str]]:
+async def search_games(query: str, limit: int = 20) -> List[Tuple[str, str]]:
     """Поиск игр в Steam. Возвращает [("steam:{appid}", name)]"""
 
     if query in _SEARCH_CACHE:
@@ -50,16 +50,21 @@ async def search_games(query: str, limit: int = 5) -> List[Tuple[str, str]]:
 
 async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float, str, str]]:
     """Получить цену для игры из Steam. Возвращает [(store, price, currency, url)]."""
-
-    cache_key = f"{game_id}:{region}"
-    if cache_key in _PRICE_CACHE:
-        store, price, cur = _PRICE_CACHE[cache_key]
-        return [(store, price, cur, f"https://store.steampowered.com/app/{game_id.split(':')[1]}")]
-
     if not game_id.startswith("steam:"):
         return []
 
     appid = game_id.split(":")[1]
+    url = f"https://store.steampowered.com/app/{appid}"
+    
+    # --- Check Cache ---
+    cache_key = f"{game_id}:{region}"
+    if cache_key in _PRICE_CACHE:
+        store, price, cur = _PRICE_CACHE[cache_key]
+        if cur == "FREE":
+             return [(store, price, cur, url)]
+        return [(store, price, cur, url)]
+
+    # --- API Request ---
     lang = "russian" if region.upper() == "RU" else "english"
     params = {
         "appids": appid,
@@ -67,6 +72,9 @@ async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float,
         "l": lang,
         "filters": "price_overview"
     }
+    
+    label = "Steam" if region.upper() == "RU" else f"Steam {region.upper()}"
+
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         try:
             async with session.get(STEAM_APPDETAILS_URL, params=params, timeout=10) as resp:
@@ -79,20 +87,34 @@ async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float,
             return []
 
     details = data.get(appid, {}).get("data")
-    if not details or details.get("is_free") or not details.get("price_overview"):
-        logger.warning(f"No price/details for {appid} in {region}, falling back to US.")
+
+    # --- Process Response ---
+    if not details:
         if region.upper() != "US":
+            logger.warning(f"No details data for {appid} in {region}. Trying fallback to US.")
             return await get_offers(game_id, "US")
         return []
 
+    # Handle free games
+    if details.get("is_free", False):
+        offer = (label, 0.0, "FREE")
+        _PRICE_CACHE[cache_key] = offer
+        return [(offer[0], offer[1], offer[2], url)]
+
+    # Handle paid games
     price_info = details.get("price_overview")
-    final_int = price_info.get("final")  # в копейках
-    currency = price_info.get("currency", "RUB")
+    if not price_info:
+        if region.upper() != "US":
+            logger.warning(f"No price_overview for {appid} in {region}. Trying fallback to US.")
+            return await get_offers(game_id, "US")
+        return []
+    
+    final_int = price_info.get("final")
+    currency = price_info.get("currency", "USD")
     if final_int is None:
         return []
 
     price = round(final_int / 100, 2)
-    label = "Steam" if region.upper() == "RU" else f"Steam {region.upper()}"
-    offer = (label, price, currency, f"https://store.steampowered.com/app/{appid}")
-    _PRICE_CACHE[cache_key] = (offer[0], offer[1], offer[2])
-    return [offer] 
+    offer_tuple = (label, price, currency)
+    _PRICE_CACHE[cache_key] = offer_tuple
+    return [(offer_tuple[0], offer_tuple[1], offer_tuple[2], url)] 

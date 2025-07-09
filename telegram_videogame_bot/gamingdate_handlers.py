@@ -159,8 +159,12 @@ async def view_like(call: CallbackQuery, state: FSMContext):
         f"Описание: {liked_user_data[7]}\n"
     )
 
-    # Удаление предыдущего сообщения
-    await call.message.delete()
+    # Удаление предыдущего сообщения (может не получиться, если сообщение слишком старое или не бот)
+    from aiogram.exceptions import TelegramBadRequest
+    try:
+        await call.message.delete()
+    except TelegramBadRequest as e:
+        print(f"Не удалось удалить сообщение: {e}")
 
     # Отправка фотографий профиля
     if liked_user_data[5]:  # Если есть фотографии

@@ -212,11 +212,9 @@ async def get_offers(game_id: str, region: str = "US", _depth: int = 0) -> List[
         if not price_str:
             return []
         currency = _currency_from_price(price_str, region)
-        # оставляем только числа, запятую меняем на точку
-        num_m = re.search(r"[\d.,]+", price_str)
-        if not num_m:
-            return []
-        raw = re.sub(r"[\s\u00A0]", "", num_m.group(0))  # убираем пробелы/NBSP
+        # Выделяем всё, что похоже на число (включая пробелы/nbsp/.,,)
+        cleaned = re.sub(r"[^0-9.,\s\u00A0]", "", price_str)
+        raw = re.sub(r"[\s\u00A0]", "", cleaned)
 
         if "," in raw and "." in raw:
             # Определяем, какой символ – десятичный: обычно последний встреченный
@@ -230,9 +228,8 @@ async def get_offers(game_id: str, region: str = "US", _depth: int = 0) -> List[
             # Формат 123,45  (запятая – десятичная)
             raw = raw.replace(',', '.')
         # else: только точка – ничего делать не нужно
-        num_raw = raw
         try:
-            price_val = float(num_raw)
+            price_val = float(raw)
         except ValueError:
             logger.warning(f"[PS] cannot parse price '{price_str}' for {game_id}")
             return []

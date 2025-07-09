@@ -186,7 +186,16 @@ async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float,
     # цену в той валюте, что пришла из GraphQL, чтобы у пользователя всё-таки была
     # хоть какая-то информация.
 
-    if region.upper() == "RU" and currency != "RUB" and not is_free:
+    REG_FALLBACK = {
+        "RU": ("RUB", "₽"),
+        "IN": ("INR", "₹"),
+        "UA": ("UAH", "₴"),
+        "KZ": ("KZT", "₸"),
+        "PL": ("PLN", "zł"),
+        "BR": ("BRL", "R$"),
+    }
+
+    if region.upper() in REG_FALLBACK and currency != REG_FALLBACK[region.upper()][0] and not is_free:
         try:
             html_headers = {
                 "Accept-Language": "ru,en;q=0.8",
@@ -205,17 +214,19 @@ async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float,
             if html_resp.status_code == 200:
                 import re
                 # Ищем число (может содержать пробелы или NBSP) перед знаком ₽, допускаем дробные цены
-                m = re.search(r"(?P<rub>[\d\s\u00A0]+(?:[.,]\d{1,2})?)\s*₽", html_resp.text)
+                iso, sym = REG_FALLBACK[region.upper()]
+                pattern = rf"(?P<num>[\d\s\u00A0]+(?:[.,]\d{{1,2}})?)\s*{re.escape(sym)}"
+                m = re.search(pattern, html_resp.text)
                 if m:
-                    rub_str = m.group("rub").replace("\u00A0", " ").replace(" ", "").replace(",", ".")
+                    num_str = m.group("num").replace("\u00A0", " ").replace(" ", "").replace(",", ".")
                     try:
-                        price = float(rub_str)
-                        currency = "RUB"
-                        logger.info(f"Epic HTML fallback succeeded for {title}: {price} RUB")
+                        price = float(num_str)
+                        currency = iso
+                        logger.info(f"Epic HTML fallback succeeded for {title}: {price} {iso}")
                     except ValueError:
-                        logger.warning(f"Epic HTML fallback: cannot convert '{rub_str}' to float for {url}")
+                        logger.warning(f"Epic HTML fallback: cannot convert '{num_str}' to float for {url}")
                 else:
-                    logger.info(f"Epic HTML fallback: ₽ not found in page for {url}")
+                    logger.info(f"Epic HTML fallback: symbol {sym} not found in page for {url}")
             else:
                 logger.warning(f"Epic HTML fallback status {html_resp.status_code} for {url}")
         except Exception as e:

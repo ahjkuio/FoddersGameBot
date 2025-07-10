@@ -108,7 +108,7 @@ async def get_offers(game_id: str, region: str = "RU") -> List[Tuple[str, float,
             logger.warning(f"No price_overview for {appid} in {region}. Trying fallback to US.")
             return await get_offers(game_id, "US")
         return []
-    
+
     final_int = price_info.get("final")
     currency = price_info.get("currency", "USD")
     if final_int is None:

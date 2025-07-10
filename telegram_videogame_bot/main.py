@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import sys
+from dotenv import load_dotenv
+load_dotenv()
 from pathlib import Path
 
 # Добавляем корневую папку проекта в sys.path

@@ -16,7 +16,6 @@ from telegram_videogame_bot import epic_store, gog_store, steam_store, ms_store,
 from telegram_videogame_bot.base_keyboards import inline_menu_keyboard
 from telegram_videogame_bot.prices_keyboards import (
     build_games_keyboard,
-    back_to_games_list_keyboard,
     build_regions_keyboard,
     REGIONS,
     build_platform_keyboard,
@@ -226,7 +225,11 @@ async def show_prices_for_game(
             store_region[store][reg] = offer
 
     if not store_region:
-        await editable_message.edit_text(f"Не удалось найти актуальные цены для <b>{selected_title}</b>.", parse_mode="HTML")
+        await editable_message.edit_text(
+            f"Не удалось найти актуальные цены для <b>{selected_title}</b>.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard(),
+        )
         return
 
     # Дополняем магазины, чтобы отображались только релевантные
@@ -274,25 +277,48 @@ async def show_prices_for_game(
         rub_pairs = []
         for reg in regions_sel:
             if reg in off_dict:
-                _sn, price, cur, url, *_ = off_dict[reg]
+                _sn, price, cur, *_ = off_dict[reg]
                 rub_val = price if cur in ["RUB", "Р", "₽"] else await convert_to_rub(price, cur)
                 rub_pairs.append((reg, rub_val if rub_val is not None else float("inf")))
             else:
                 rub_pairs.append((reg, float("inf")))
-        
+
         region_sorted = [r for r, _ in sorted(rub_pairs, key=lambda x: x[1])]
         region_parts = []
         for reg in region_sorted:
             if reg in off_dict:
-                _sn, price, cur, url, *_ = off_dict[reg]
-                price_str = await fmt_price(price, cur)
+                _sn, price, cur, url, *rest = off_dict[reg]
+                plus_flag = rest[0] if rest else False
+
+                # --- подписочные варианты ---
+                if plus_flag and store == "ms" and price <= 0.01:
+                    price_str = "В подписке"
+                elif price <= 0.01 and store == "ps" and plus_flag:
+                    price_str = "PS Plus"
+                else:
+                    price_str = await fmt_price(price, cur)
+
                 # --- подписка: Game Pass или PS Plus ---
                 sub_suffix = ""
                 if len(off_dict[reg]) >= 5:
                     if store == "ms" and off_dict[reg][4]:
-                        sub_suffix = " <i>(Game Pass)</i>"
+                        # Если передана скидка в 7-м элементе — показываем обе цены
+                        if len(off_dict[reg]) >= 7 and off_dict[reg][6]:
+                            disc_val = off_dict[reg][6]
+                            disc_str = await fmt_price(disc_val, cur)
+                            price_str = f"{price_str} (С Game Pass {disc_str})"
+                            sub_suffix = ""  # уже указали
+                        else:
+                            sub_suffix = " <i>(в Game Pass)</i>"
                     elif store == "ps" and off_dict[reg][4]:
-                        sub_suffix = " <i>(PS Plus)</i>"
+                        # Если передана цена со скидкой – показываем обе
+                        if len(off_dict[reg]) >= 8 and off_dict[reg][7]:
+                            disc_val = off_dict[reg][7]
+                            disc_str = await fmt_price(disc_val, cur)
+                            price_str = f"{price_str} (PS Plus {disc_str})"
+                            sub_suffix = ""
+                        else:
+                            sub_suffix = " <i>(PS Plus)</i>"
 
                 # --- совместимость платформ ---
                 hw_suffix = ""
@@ -313,11 +339,21 @@ async def show_prices_for_game(
                     elif "ps5" in platforms and "PS5" not in hardware:
                         hw_suffix = " <i>(PS4 only)</i>"
 
-                region_parts.append(f"{flag_map.get(reg, reg)} <a href='{url}'>{price_str}{sub_suffix}{hw_suffix}</a>")
+                # Избегаем дублирования пометки, когда игра уже «В подписке»
+                if store == "ms" and price_str == "В подписке":
+                    sub_suffix = ""
+
+                # --- депозит для предзаказов в PlayStation Store ---
+                deposit_suffix = ""
+                if store == "ps" and len(off_dict[reg]) >= 7 and off_dict[reg][6]:
+                    deposit_suffix = " <i>(депозит)</i>"
+
+                region_parts.append(f"{flag_map.get(reg, reg)} <a href='{url}'>{price_str}{sub_suffix}{deposit_suffix}{hw_suffix}</a>")
             else:
                 region_parts.append(f"{flag_map.get(reg, reg)} 🚫")
         display = STORE_DISPLAY.get(store, store.capitalize())
-        lines.append(f"• <b>{display}</b>: " + " | ".join(region_parts))
+        regions_text = "\n   " + "\n   ".join(region_parts)
+        lines.append(f"• <b>{display}</b>:" + regions_text)
 
     text = f"💰 Актуальные цены для <b>{selected_title}</b>:\n\n" + "\n".join(lines)
     await editable_message.edit_text(
@@ -401,12 +437,27 @@ async def process_search_name(message: types.Message, state: FSMContext):
     if not all_games:
         await message.answer(
             "😔 К сожалению, я ничего не нашёл. Попробуйте другое название.",
-            reply_markup=inline_menu_keyboard,
+            reply_markup=cancel_keyboard(),
         )
         return
 
     # Группировка
     game_groups = group_games_by_title(all_games)
+
+    # --- Сортировка по релевантности запроса ---
+    query_norm = message.text.lower().strip()
+
+    def _relevance_key(group):
+        title_norm = group["title"].lower()
+        if title_norm == query_norm:
+            return (0, len(title_norm))
+        if title_norm.startswith(query_norm):
+            return (1, len(title_norm))
+        if query_norm in title_norm:
+            return (2, len(title_norm))
+        return (3, len(title_norm))
+
+    game_groups.sort(key=_relevance_key)
     
     # Сохраняем все группы и названия в состояние
     final_titles = [group["title"] for group in game_groups]
@@ -441,11 +492,13 @@ async def process_game_choice(callback: types.CallbackQuery, state: FSMContext):
     try:
         game_groups = data["game_groups"]
         selected_group = game_groups[title_idx]
+
+        # Переходим к показу цен
         await show_prices_for_game(callback.message, state, selected_group, title_idx)
     except (KeyError, IndexError):
         await callback.message.edit_text("Произошла ошибка, попробуйте заново. /prices")
         return
-        
+
 
 @router.callback_query(F.data == "price_back")
 async def price_back(callback: types.CallbackQuery, state: FSMContext):
@@ -494,7 +547,7 @@ async def price_back(callback: types.CallbackQuery, state: FSMContext):
         # Optionally, show the main menu again
         # await base_handlers.cmd_main_menu(callback.message, state)
 
-    await callback.answer()
+        await callback.answer()
 
 
 @router.callback_query(F.data == "price_cancel", StateFilter("*"))
@@ -576,3 +629,6 @@ async def process_page_switch(callback: types.CallbackQuery, state: FSMContext):
         if "message is not modified" not in str(e).lower():
             logger.error(f"Pagination edit error: {e}")
     await callback.answer() 
+
+
+# --- Выбор издания PS --- 

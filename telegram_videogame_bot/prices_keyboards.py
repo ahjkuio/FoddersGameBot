@@ -106,6 +106,18 @@ def build_regions_keyboard(selected: set[str]) -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="↩️ Назад", callback_data="price_back"))
     return builder.as_markup()
 
+# --- Выбор издания PlayStation ---
+
+def build_editions_keyboard(editions: list[tuple[str, str]]):
+    """Клавиатура для выбора издания (PlayStation Store). *editions* – список (game_id, title)."""
+    builder = InlineKeyboardBuilder()
+    for idx, (_gid, title) in enumerate(editions):
+        builder.row(InlineKeyboardButton(text=title, callback_data=f"ps_edition_{idx}"))
+
+    builder.row(InlineKeyboardButton(text="↩️ Назад", callback_data="price_back"))
+    builder.row(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
+    return builder.as_markup()
+
 # --- Старые версии для обратной совместимости (пока) ---
 
 def games_keyboard(games):

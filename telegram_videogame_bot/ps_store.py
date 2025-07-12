@@ -16,10 +16,24 @@ import os
 from typing import List, Tuple, Dict, Any
 from cachetools import TTLCache
 from loguru import logger
+from urllib.parse import urlencode as _urlencode
+import asyncio
+
+# Валюты, в которых PlayStation Store возвращает цены уже в целых единицах,
+# поэтому делить на 100 не нужно (иначе получим ×0.01).
+_NO_DECIMAL_CURRENCIES = {
+    "INR",  # Indian Rupee
+    "JPY",  # Japanese Yen
+    "KRW",  # South Korean Won
+    "HUF",  # Hungarian Forint
+    "CLP",  # Chilean Peso
+    "VND",  # Vietnamese Dong
+}
+
 
 # --- Caches ---
 _SEARCH_CACHE: TTLCache[str, List[Tuple[str, str]]] = TTLCache(maxsize=1024, ttl=12 * 60 * 60)  # 12h
-_PRODUCT_CACHE: TTLCache[Tuple[str, str], Dict[str, Any]] = TTLCache(maxsize=4096, ttl=30 * 60)  # 30m
+_PRODUCT_CACHE: TTLCache[Tuple[str, str], List[Tuple]] = TTLCache(maxsize=4096, ttl=30 * 60)  # 30m
 
 # --- Region → locale mapping ---
 _REGION_TO_LOCALE = {
@@ -28,10 +42,24 @@ _REGION_TO_LOCALE = {
     "TR": "tr-tr",
     "BR": "pt-br",
     "AR": "es-ar",
-    "IN": "en-in",   # India
-    "UA": "uk-ua",  # Ukraine
-    "KZ": "ru-ru",  # Kazakhstan (ru locale подходит)
-    "PL": "pl-pl",  # Poland
+    "IN": "en-in",
+    "UA": "ru-ua",  # PlayStation Store для Украины, чтобы была гривна
+    "KZ": "ru-ru",  # PlayStation Store для Казахстана использует русский язык и цены
+    "PL": "pl-pl",
+}
+
+# Для удобства построения URL вида https://store.playstation.com/{lang}-{country.lower()}/product/{id}
+# где lang – язык, а country – ISO-код страны.
+PS_REGION_CONFIG = {
+    "us": ("en", "US"),
+    "ru": ("ru", "RU"),
+    "tr": ("tr", "TR"),
+    "br": ("pt", "BR"),
+    "ar": ("es", "AR"),
+    "in": ("en", "IN"),
+    "ua": ("ru", "UA"),
+    "kz": ("ru", "KZ"),
+    "pl": ("pl", "PL"),
 }
 
 HEADERS = {
@@ -41,292 +69,13 @@ HEADERS = {
 }
 
 # --- GraphQL (internal PSN API) settings ---
-_PSN_COOKIE: str = os.getenv("PSN_COOKIE", "")
 _GQL_ENDPOINT = "https://web.np.playstation.com/api/graphql/v1/op"
-# публикатор запроса conceptRetrieveForCtasWithPrice (версии 1) — постоянный хэш
-_GQL_HASH = "eab9d873f90d4ad98fd55f07b6a0a606e6b3925f2d03b70477234b79c1df30b5"
+_OP_PRODUCT_CTA = "productRetrieveForCtasWithPrice"
+_HASH_PRODUCT_CTA = "8872b0419dcab2fea5916ef698544c237b1096f9e76acc6aacf629551adee8cd"
 
-# Заголовки для GraphQL запросов. Cookie добавляем только если она задана.
-_GQL_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": HEADERS["User-Agent"],
-    "Origin": "https://store.playstation.com",
-}
-if _PSN_COOKIE:
-    _GQL_HEADERS["Cookie"] = _PSN_COOKIE
 
 _SEARCH_URL_TEMPLATE = "https://store.playstation.com/{locale}/search/{query}"
 _PRODUCT_URL_TEMPLATE = "https://store.playstation.com/{locale}/product/{product_id}"
-_GAMES_URL_TEMPLATE = "https://store.playstation.com/{locale}/games/{slug}"
-
-
-def _slugify(title: str) -> str:
-    """Грубая транслитерация в slug PlayStation /games/ URL."""
-    import unicodedata, re
-    txt = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
-    txt = re.sub(r"[^a-zA-Z0-9]+", "-", txt.strip()).strip("-").lower()
-    return txt
-
-
-async def _fetch_games_price(title: str, region: str) -> tuple[str | None, float | None]:
-    """Пробует получить цену со страницы /games/<slug>. Возвращает (currency, value) либо (None, None)."""
-    if not title:
-        return None, None
-    locale = _REGION_TO_LOCALE.get(region.upper(), "en-us")
-    slug = _slugify(title)
-    url = _GAMES_URL_TEMPLATE.format(locale=locale, slug=slug)
-    try:
-        async with aiohttp.ClientSession(headers={**HEADERS, "Accept-Language": locale}) as session:
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    return None, None
-                html_page = await resp.text()
-    except Exception:
-        return None, None
-
-    prices_found = re.findall(r"display-price\"[^>]*>([^<]{1,60})<", html_page)
-    if not prices_found:
-        prices_found = re.findall(r"displayPrice[^>]*>([^<]{1,60})<", html_page)
-    if not prices_found:
-        prices_found = re.findall(r'"priceOrText":"([^"\n]{1,40})"', html_page)
-
-    best_val = 0.0
-    best_txt = ""
-    for cand in prices_found:
-        m = re.search(r"[0-9]+(?:[\.,][0-9]{1,2})?", cand)
-        if not m:
-            continue
-        try:
-            val = float(m.group(0).replace(",", "."))
-        except ValueError:
-            continue
-        if val > best_val:
-            best_val = val
-            best_txt = cand.strip()
-
-    if not best_txt:
-        return None, None
-
-    curr = _currency_from_price(best_txt, region)
-    return curr, best_val
-
-
-# ---------------------------------------------------------------------------
-# GraphQL price fetcher
-# ---------------------------------------------------------------------------
-
-async def _fetch_price_graphql(concept_id: str | None, region: str) -> tuple[str | None, float | None]:
-    """Получает цену через внутренний GraphQL-эндпоинт. Возвращает (currency, value) либо (None, None).
-
-    Требуется актуальная переменная окружения PSN_COOKIE с cookies, скопированными из браузера.
-    """
-    if not concept_id or not _PSN_COOKIE:
-        return None, None
-
-    logger.info(f"[PS] GraphQL conceptId={concept_id} region={region} cookie_sent={bool(_PSN_COOKIE)}")
-
-    # Формируем URL аналогично тому, что шлёт браузер (GET с PersistedQuery).
-    import aiohttp.helpers as _ah
-    variables = json.dumps({"conceptId": str(concept_id)}, separators=(",", ":"))
-    extensions = json.dumps({"persistedQuery": {"version": 1, "sha256Hash": _GQL_HASH}}, separators=(",", ":"))
-    params = {
-        "operationName": "conceptRetrieveForCtasWithPrice",
-        "variables": variables,
-        "extensions": extensions,
-    }
-    from urllib.parse import urlencode as _urlencode
-    url = _GQL_ENDPOINT + "?" + _urlencode(params)
-
-    try:
-        async with aiohttp.ClientSession(headers={**_GQL_HEADERS, "Accept-Language": _REGION_TO_LOCALE.get(region.upper(), "en-us")}) as session:
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    return None, None
-                data = await resp.json()
-    except Exception as e:
-        logger.info(f"[PS] GraphQL HTTP error: {e}")
-        return None, None
-
-    try:
-        sku = data["data"]["concept"]["defaultSku"]
-        price_block = sku.get("price") or {}
-        actual = price_block.get("actualPrice") or {}
-        val = actual.get("value") or actual.get("amount")
-        cur = actual.get("currencyCode") or actual.get("currency")
-        if val is None or cur is None:
-            return None, None
-        return cur, float(val)
-    except Exception as e:
-        logger.info(f"[PS] GraphQL parse error: {e}")
-        return None, None
-
-# ---------------------------------------------------------------------------
-# Generic HTML price extractor (for /product/ and /games/)
-# ---------------------------------------------------------------------------
-
-_SYM_GROUP = r"R\$|US\$|ARS\$|ARS|MXN\$|CLP\$|Rs|TL|UAH|KZT|\$|€|£|₺|¥|₽|₹|₴|₸|zł|zl"
-
-# Слова/фразы, по которым можно однозначно распознать DLC-товары (Gold Bars, Online, демо-версии)
-_HTML_STOP_WORDS = [
-    "gold bar", "gold bars", "red dead online", "online",         # en
-    "barra de ouro", "barras de ouro",                              # pt-br
-    "altın külçe",                                                   # tr
-    "золот", "слитк",                                              # ru
-    "ознайом", "демо",                                             # ua
-    "trial", "demo",                                               # generic
-    "deneme",                                                      # tr (trial)
-]
-_STOP_RE = re.compile("|".join(re.escape(w) for w in _HTML_STOP_WORDS), re.IGNORECASE)
-
-
-def _collect_html_prices(html: str, region: str) -> List[Tuple[float, str]]:
-    """Возвращает список (value, currency) всех цен, найденных в HTML."""
-    pat = rf"(?:({_SYM_GROUP})\s*([0-9][0-9\s\u00A0\.,]{{0,10}})|([0-9][0-9\s\u00A0\.,]{{0,10}})\s*({_SYM_GROUP}))"
-    rex = re.compile(pat)
-
-    def _parse_float(txt: str) -> float | None:
-        """Преобразует строку с ценой в float, корректно обрабатывая тысячи '.'/',' и десятичные."""
-        if not txt:
-            return None
-        buf = txt.replace("\u00A0", "").replace(" ", "")
-        # Если и точка, и запятая – определяем десятичный разделитель по последнему символу
-        if "," in buf and "." in buf:
-            last_dot = buf.rfind('.')
-            last_comma = buf.rfind(',')
-            if last_comma > last_dot:
-                dec_pos = last_comma
-                dec_char = ','
-            else:
-                dec_pos = last_dot
-                dec_char = '.'
-            int_part = re.sub(r"[.,]", "", buf[:dec_pos])
-            dec_part = buf[dec_pos + 1:]
-            if not dec_part.isdigit():
-                dec_part = "0"
-            buf_norm = f"{int_part}.{dec_part}"
-        elif "," in buf:
-            # либо 1.234 либо 39,99
-            last_comma = buf.rfind(',')
-            dec_len = len(buf) - last_comma - 1
-            if dec_len == 2:
-                int_part = re.sub(r",", "", buf[:last_comma])
-                dec_part = buf[last_comma + 1:]
-                buf_norm = f"{int_part}.{dec_part}"
-            else:
-                buf_norm = buf.replace(',', '')
-        else:
-            buf_norm = buf
-        try:
-            return float(buf_norm)
-        except ValueError:
-            return None
-
-    res: list[Tuple[float, str]] = []
-    for m in rex.finditer(html):
-        sym = m.group(1) or m.group(4)
-        num_raw = m.group(2) or m.group(3)
-        if not (sym and num_raw):
-            continue
-
-        # контекст 120 символов вокруг цены – если нашли стоп-слово, пропускаем
-        ctx_start = max(0, m.start() - 120)
-        ctx_end   = min(len(html), m.end() + 120)
-        ctx = html[ctx_start:ctx_end]
-        if _STOP_RE.search(ctx):
-            continue
-
-        val = _parse_float(num_raw)
-        if val is None:
-            continue
-        cur = _currency_from_price(sym, region)
-        res.append((val, cur))
-    return res
-
-
-def _select_full_price(prices: List[Tuple[float, str]], currency: str, *, deluxe_mode: bool) -> float | None:
-    """Для стандартных изданий берёт минимальную цену > порога.
-    Для Deluxe/Ultimate/Bundles – наоборот максимальную (но тоже > порога, если есть)."""
-    if not prices:
-        return None
-    values = [v for v, cur in prices if cur == currency]
-    if not values:
-        # если символы смешаны, просто берём макс по всем
-        values = [v for v, _ in prices]
-        return max(values)
-
-    dep_limit = {
-        "USD": 30,
-        "UAH": 500,
-        "TRY": 500,
-        "ARS": 5000,
-        "INR": 700,
-        "KZT": 9000,
-        "BRL": 80,
-        "PLN": 100,
-        "RUB": 700,
-    }.get(currency, 0)
-
-    above = [v for v in values if v > dep_limit]
-
-    if deluxe_mode:
-        # Для Deluxe-/Ultimate-изданий берём максимальную среди «не депозитных»
-        return max(above) if above else max(values)
-
-    # --- Standard Edition ---
-    if not above:
-        # остались только (возможно) депозитные – берём максимальное, чтобы отсеять $ 79.99 и пр.
-        return max(values)
-
-    # Убираем дубликаты (они мешают сравнению соседей)
-    uniq = sorted(set(above))
-
-    if len(uniq) == 1:
-        return uniq[0]
-
-    # Отбрасываем все начальные элементы, которые меньше половины следующего – это почти наверняка DLC / виртуальная валюта
-    idx = 0
-    while idx + 1 < len(uniq) and uniq[idx] * 1.8 <= uniq[idx + 1]:
-        idx += 1  # пропускаем маленькую цену
-
-    # Если всё отбросили (маловероятно) – берём последнюю оставшуюся
-    clean = uniq[idx:]
-    if not clean:
-        clean = [uniq[-1]]
-
-    if deluxe_mode:
-        return max(clean)
-
-    # Standard edition → берём минимальную из «чистого» списка
-    return clean[0]
-
-
-_CURRENCY_SYMBOL_MAP = [
-    ("R$", "BRL"),
-    ("US$", "USD"),
-    ("ARS$", "ARS"),
-    ("ARS", "ARS"),
-    ("MXN$", "MXN"),
-    ("CLP$", "CLP"),
-    ("Rs", "INR"),
-    ("TL", "TRY"),
-    ("UAH", "UAH"),
-    ("KZT", "KZT"),
-    ("€", "EUR"),
-    ("£", "GBP"),
-    ("₺", "TRY"),
-    ("¥", "CNY"),
-    ("₽", "RUB"),
-    ("₹", "INR"),
-    ("₴", "UAH"),
-    ("₸", "KZT"),
-    ("zł", "PLN"),
-    ("zl", "PLN"),
-    ("$", "USD"),  # самый общий символ – в конце
-]
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 
 def _extract_next_data(html: str) -> Dict[str, Any] | None:
@@ -336,465 +85,509 @@ def _extract_next_data(html: str) -> Dict[str, Any] | None:
         return None
     try:
         return json.loads(m.group(1))
-    except Exception as e:
+    except (json.JSONDecodeError, TypeError) as e:
         logger.warning(f"[PS] JSON decode error: {e}")
         return None
 
+# --------------------------------------------------------------------------------------
+# Поиск
+# --------------------------------------------------------------------------------------
 
-def _currency_from_price(price_str: str, region: str) -> str:
-    """Определяет трёхбуквенный код валюты по её символу/тексту.
+async def search_games(query: str, *, region: str = "US", limit: int = 40) -> List[Tuple[str, str, str | None, str | None]]:
+    """Поиск игр в PS Store через __NEXT_DATA__ на странице поиска.
 
-    Особый случай – одиночный символ "$":
-    он используется и в US (USD), и в странах Латинской Америки (ARS, CLP, MXN и др.).
-    Поэтому, если нашли только "$", смотрим на регион.
+    Возвращает список кортежей (game_id, title, concept_id, invariant_name),
     """
-    for symbol, cur in _CURRENCY_SYMBOL_MAP:
-        if symbol in price_str:
-            if symbol == "$":
-                return {
-                    "AR": "ARS",
-                    "CL": "CLP",
-                    "MX": "MXN",
-                    "US": "USD",
-                }.get(region, "USD")
-            return cur
-    # fallback by region
-    return {
-        "RU": "RUB",
-        "TR": "TRY",
-        "BR": "BRL",
-        "AR": "ARS",
-        "IN": "INR",
-        "UA": "UAH",
-        "KZ": "KZT",
-        "PL": "PLN",
-    }.get(region, "USD")
-
-
-async def search_games(query: str, *, region: str = "US", limit: int = 40) -> List[Tuple[str, str]]:
-    """Поиск игр в PS Store через публичную HTML-страницу search/QUERY."""
     if not query:
         return []
-    region = region.upper()
+
     locale = _REGION_TO_LOCALE.get(region, "en-us")
-    cache_key = f"{locale}:{query.lower()}"
+    # v3 кэша с invariantName
+    cache_key = f"{locale}:{query.lower()}:v3"
     if cache_key in _SEARCH_CACHE:
-        return _SEARCH_CACHE[cache_key][:limit]
+        cached_item = _SEARCH_CACHE[cache_key]
+        if len(cached_item) > 0 and len(cached_item[0]) == 4:
+             return cached_item[:limit]
 
     url = _SEARCH_URL_TEMPLATE.format(locale=locale, query=aiohttp.helpers.quote(query))
     try:
         async with aiohttp.ClientSession(headers={**HEADERS, "Accept-Language": locale}) as session:
-            async with session.get(url, timeout=20) as resp:
+            async with session.get(url, timeout=15) as resp:
                 if resp.status != 200:
                     logger.info(f"[PS] search HTTP {resp.status}")
-                    _SEARCH_CACHE[cache_key] = []
                     return []
                 html = await resp.text()
     except Exception as e:
-        logger.warning(f"[PS] search error: {e}")
-        _SEARCH_CACHE[cache_key] = []
+        logger.warning(f"[PS] search HTTP error: {e}")
         return []
 
     data = _extract_next_data(html)
     if not data:
-        _SEARCH_CACHE[cache_key] = []
+        logger.warning("[PS] could not find __NEXT_DATA__ on search page")
         return []
 
     apollo = data.get("props", {}).get("apolloState", {})
+    if not apollo:
+        return []
 
-    results: List[Tuple[str, str]] = []
+    results: List[Tuple[str, str, str | None, str | None]] = []
     for key, item in apollo.items():
         if not key.startswith("Product:"):
             continue
         title = item.get("name")
         pid = item.get("id") or key.split(":", 1)[1]
+        invariant_name = item.get("invariantName")
+        
+        concept_ref = item.get("concept", {}).get("__ref")
+        concept_id = None
+        if concept_ref:
+            raw_id = concept_ref.split(":", 1)[1]
+            # Иногда в concept находится productId, а не числовой conceptId.
+            # Настоящие conceptId - это числа.
+            if raw_id and raw_id.isdigit():
+                concept_id = raw_id
+            else:
+                 # Если это не число, скорее всего, это productId, и реального conceptId нет.
+                 logger.debug(f"Concept ref '{raw_id}' is not a digit, likely a productId. Skipping concept_id.")
+
+
         if not title or not pid:
             continue
+        
         game_id = f"ps:{pid}"
-        results.append((game_id, title))
-        # сохраняем объект продукта для зоны региона
-        _PRODUCT_CACHE[(region, game_id)] = item
+        results.append((game_id, title, concept_id, invariant_name))
 
-        if len(results) >= limit:
-            break
+    if not results:
+        logger.info(f"[PS] No products found in apolloState for '{query}'")
+        return []
 
+    def relevance_key(game_title: str) -> tuple:
+        title_norm = game_title.lower()
+        query_norm = query.lower().strip()
+        
+        # Score based on match type
+        if title_norm == query_norm:
+            match_score = 0
+        elif title_norm.startswith(query_norm):
+            match_score = 1
+        elif query_norm in title_norm:
+            match_score = 2
+        else:
+            match_score = 3
+            
+        # Penalize common non-game words unless they were part of the search
+        penalty = 0
+        non_game_terms = ["dlc", "add-on", "pack", "set", "pass", "points", "credits", "currency", "silver", "bundle", "edition", "demo", "trial"]
+        for term in non_game_terms:
+            if term in title_norm and term not in query_norm:
+                penalty += 1
+        
+        # Lower score is better. Shorter titles are preferred as a tie-breaker.
+        return (match_score, penalty, len(game_title))
+
+    results.sort(key=lambda x: relevance_key(x[1]))
+    
+    results = results[:limit]
+    
     _SEARCH_CACHE[cache_key] = results
     return results
 
+async def search_ps_store_games_for_country(session, query: str, lang: str, country_code: str, invariant_name: str, limit: int = 40) -> List[Dict[str, str]]:
+    """Ищет игру в PS Store для конкретного региона и возвращает подходящие результаты как список словарей.
 
-async def _fetch_html_proxy(url: str, _region: str, locale: str, *, tries: int = 1) -> str | None:
-    """Скачивает HTML напрямую (прокси отключены). Оставил сигнатуру для совместимости."""
-    logger.info(f"[PS] HTML fetch {url}")
+    • `query` – исходный запрос пользователя, используется для локального поиска.
+    • `lang` и `country_code` – служебные, чтобы можно было в будущем задавать Accept-Language, если понадобится.
+    • `invariant_name` – каноничное английское название, по которому фильтруем результаты.
+    """
+    # Используем уже существующую функцию search_games, игнорируя session (она там не нужна)
+    region = country_code.upper()
     try:
-        async with aiohttp.ClientSession(headers={**HEADERS, "Accept-Language": locale}) as session:
-            async with session.get(url, timeout=8) as resp:
-                logger.info(f"[PS] HTML status {resp.status} {url}")
-                if resp.status == 200:
-                    return await resp.text()
+        results = await search_games(query, region=region, limit=limit)
     except Exception as e:
-        logger.info(f"[PS] HTML error {e} for {url}")
-    return None
+        logger.error(f"[PS] Ошибка поиска игры '{query}' в регионе {region}: {e}")
+        return []
+
+    # Конвертируем результаты в словари и фильтруем по invariant_name
+    filtered = []
+    for game_id, title, concept_id, inv_name in results:
+        pid = game_id.split(":", 1)[1] if ":" in game_id else game_id
+        if inv_name and invariant_name and inv_name.lower() == invariant_name.lower():
+            filtered.append({"id": pid, "title": title})
+        elif not invariant_name:
+            # Если нет invariant_name для фильтрации, берем как есть (fallback)
+            filtered.append({"id": pid, "title": title})
+
+    # Если после фильтрации ничего не осталось, вернем оригинальные результаты (хотя бы один)
+    if not filtered:
+        filtered = [{"id": game_id.split(":", 1)[1] if ":" in game_id else game_id, "title": title} for game_id, title, *_ in results]
+
+    return filtered
 
 
-async def _fetch_product(pid: str, region: str) -> Dict[str, Any] | None:
-    """Запрос HTML страницы продукта для получения JSON."""
-    locale = _REGION_TO_LOCALE.get(region, "en-us")
-    url = _PRODUCT_URL_TEMPLATE.format(locale=locale, product_id=pid)
-    html = await _fetch_html_proxy(url, region, locale)
-    if html is None:
+# --------------------------------------------------------------------------------------
+# Получение цен
+# --------------------------------------------------------------------------------------
+
+async def _fetch_price_product(product_id: str | None, region: str) -> dict | None:
+    """Возвращает необработанные данные о продукте из GraphQL."""
+    if not product_id:
         return None
 
+    cache_key = (product_id, region)
+    if cache_key in _PRODUCT_CACHE:
+        return _PRODUCT_CACHE[cache_key]
+
+    locale = _REGION_TO_LOCALE.get(region.upper(), "en-us")
+    variables = {"productId": product_id}
+    params = {
+        "operationName": _OP_PRODUCT_CTA,
+        "variables": json.dumps(variables, separators=(",", ":")),
+        "extensions": json.dumps(
+            {"persistedQuery": {"version": 1, "sha256Hash": _HASH_PRODUCT_CTA}},
+            separators=(",", ":"),
+        ),
+    }
+    url = f"{_GQL_ENDPOINT}?{_urlencode(params)}"
+    headers = {
+        "x-apollo-operation-name": _OP_PRODUCT_CTA,
+        "Accept": "application/json",
+        "Accept-Language": locale,
+        "User-Agent": HEADERS["User-Agent"],
+        "x-ps-country-code": region.upper(),
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status != 200:
+                    logger.info(f"[PS_API] CTA HTTP {resp.status} for {product_id} in {region}")
+                    return None
+                data = await resp.json()
+                product_data = data.get("data", {}).get("productRetrieve")
+                if product_data:
+                    _PRODUCT_CACHE[cache_key] = product_data
+                return product_data
+    except Exception as e:
+        logger.info(f"[PS_API] CTA HTTP error for {product_id} in {region}: {e}")
+        return None
+
+
+async def get_product_id_from_concept(concept_id: str, region: str) -> str | None:
+    """Получает региональный product_id со страницы концепта."""
+    locale = _REGION_TO_LOCALE.get(region, "en-us")
+    url = f"https://store.playstation.com/{locale}/concept/{concept_id}"
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Failed to fetch concept page {url}, status: {resp.status}")
+                    return None
+                html = await resp.text()
+    except Exception as e:
+        logger.warning(f"Error fetching concept page {url}: {e}")
+        return None
+    
     data = _extract_next_data(html)
     if not data:
+        logger.warning(f"Could not find __NEXT_DATA__ on concept page {url}")
         return None
+        
+    try:
+        # Ищем ID продукта в `apolloState` по ключу, начинающемуся с `Product:`
+        apollo_state = data.get("props", {}).get("apolloState", {})
+        for key, value in apollo_state.items():
+            if key.startswith("Product:") and value.get("id"):
+                product_id = value.get("id")
+                logger.info(f"Found product_id '{product_id}' for concept '{concept_id}' in region '{region}'")
+                return product_id
+    except Exception as e:
+        logger.error(f"Error parsing __NEXT_DATA__ from concept page {url}: {e}")
 
-    # Результирующий объект товара, который найдём ниже,
-    # дополним исходным HTML, чтобы повторно не скачивать его при get_offers.
-    # Это ускоряет процесс и повышает шанс получить цены, если второй запрос сорвётся.
-    product_html: str | None = html
-
-    apollo = data.get("props", {}).get("apolloState", {})
-    for key, item in apollo.items():
-        if key.startswith("Product:") and item.get("id") == pid:
-            # дополним conceptId, если он отсутствует
-            if "conceptId" not in item:
-                concept = item.get("concept")
-                if isinstance(concept, dict):
-                    cid = concept.get("id")
-                    if cid:
-                        item["conceptId"] = cid
-                elif isinstance(concept, str) and concept.startswith("Concept:"):
-                    item["conceptId"] = concept.split(":", 1)[1]
-
-            # Кэшируем HTML внутри объекта, чтобы им могли воспользоваться другие функции.
-            if product_html is not None:
-                item["__html"] = product_html
-
-            return item
+    logger.warning(f"Could not find product_id for concept {concept_id} on page {url}")
     return None
 
 
-async def get_offers(game_id: str, region: str = "US", _depth: int = 0) -> List[Tuple]:
-    """Возвращает [(store_label, price, currency, url, ps_plus, platforms, deposit_flag)].
-
-    deposit_flag == True, если полученная цена является задатком (депозитом) при предзаказе
-    и полная стоимость пока скрыта PlayStation Store.
+async def get_product_price(product_id: str, country_code: str) -> dict | None:
     """
-    if not game_id.startswith("ps:"):
-        return []
+    Извлекает и обрабатывает информацию о цене для заданного продукта.
+    """
+    if product_id.startswith("ps:"):
+        product_id = product_id[3:]
 
-    region = region.upper()
-    cache_key = (region, game_id)
-    product = _PRODUCT_CACHE.get(cache_key)
+    product_data = await _fetch_price_product(product_id, country_code)
 
-    if product is None:
-        pid = game_id.split(":", 1)[1]
-        product = await _fetch_product(pid, region)
-        if product is None:
-            # Фоллбэк: попытаться найти продукт по имени (если глубина 0)
-            if _depth == 0:
-                # Берём название из любого кэша, если есть
-                title_guess = None
-                for (_r, gid), obj in _PRODUCT_CACHE.items():
-                    if gid == game_id:
-                        title_guess = obj.get("name")
-                        break
-                if not title_guess:
-                    # как крайний случай – по id без префикса
-                    title_guess = pid.split("_", 1)[0]
-                candidates = await search_games(title_guess, region=region, limit=1)
-                if candidates:
-                    return await get_offers(candidates[0][0], region, _depth=1)
-            return []
-        _PRODUCT_CACHE[cache_key] = product
+    if not product_data or not product_data.get("webctas"):
+        logger.warning(
+            f"Не найдены CTA для product_id: {product_id} в регионе {country_code}"
+        )
+        return None
 
-    # --- Platforms ---
-    platforms = product.get("platforms") or []
-    if not platforms:
-        pid_guess = product.get("id", "")
-        if not pid_guess and game_id.startswith("ps:"):
-            pid_guess = game_id.split(":", 1)[1]
-        if "PPSA" in pid_guess or "PUSA" in pid_guess:
-            platforms = ["PS5"]
-        elif "CUSA" in pid_guess:
-            platforms = ["PS4"]
+    purchase_cta = None
+    catalog_cta = None
+    download_cta = None
+    
+    # 1. Ищем основные типы предложений
+    for cta in product_data["webctas"]:
+        cta_type = cta.get("type")
+        if cta_type in ["ADD_TO_CART", "PRE_ORDER"]:
+            purchase_cta = cta
+        elif cta_type == "UPSELL_PS_PLUS_GAME_CATALOG":
+            catalog_cta = cta
+        elif cta_type == "DOWNLOAD":
+            download_cta = cta
+    
+    # 2. Выбираем основной оффер для определения цены
+    main_cta = purchase_cta or catalog_cta or download_cta
+    
+    if not main_cta or not main_cta.get("price"):
+        logger.warning(
+            f"Не удалось найти основной оффер с ценой для {product_id} в {country_code}. CTAs: {product_data['webctas']}"
+        )
+        return None
+        
+    price_info = main_cta.get("price")
+    
+    # Если есть и покупка, и каталог, цена покупки приоритетнее
+    if purchase_cta and purchase_cta.get("price"):
+        price_info = purchase_cta.get("price")
 
-    # --- Price ---
-    price_info = product.get("price") or {}
-    is_free = price_info.get("isFree", False)
+    # 3. Парсим информацию о цене
+    try:
+        currency_code = price_info.get("currencyCode") or ""
+        divisor = 1 if currency_code in _NO_DECIMAL_CURRENCIES else 100
 
-    # Инициализация, чтобы переменные были доступны далее в любом случае
-    base_price_str: str | None = None
-    disc_price_str: str | None = None
+        base_price_value = price_info.get("basePriceValue", 0)
+        discounted_value = price_info.get("discountedValue", 0)
+        
+        # Для игр из каталога цена покупки может быть в basePrice, а discounted - 0 ("Included")
+        if catalog_cta and not purchase_cta:
+             # Если игра только в каталоге, ее цена покупки - это basePrice, а цена по подписке - 0
+             final_price = 0.0
+             old_price = base_price_value / divisor if base_price_value else 0.0
+        else:
+            final_price = discounted_value / divisor
+            old_price = base_price_value / divisor
+        
+        discount = 0
+        if old_price > 0 and final_price < old_price:
+            discount = round(100 - (final_price * 100 / old_price))
+        
+        # Определяем, включена ли игра в PS Plus
+        is_included_in_plus = catalog_cta is not None and (final_price == 0.0 or "Included" in (price_info.get("discountText") or ""))
 
-    if is_free:
-        price_val = 0.0
-        currency = "FREE"
-        deposit_flag = False # Ensure it's False for free games
-    else:
-        base_price_str = price_info.get("basePrice")
-        disc_price_str = price_info.get("discountedPrice")
+        # Ищем отдельную скидку для подписчиков PS Plus
+        ps_plus_price = None
+        is_ps_plus_special = False
+        plus_discount_cta = next((c for c in product_data["webctas"] if c.get("type") == "UPSELL_PS_PLUS_DISCOUNT" and c.get("price")), None)
+        if plus_discount_cta:
+            plus_price_info = plus_discount_cta["price"]
+            plus_discounted_value = plus_price_info.get("discountedValue")
+            if plus_discounted_value is not None:
+                ps_plus_price = plus_discounted_value / 100
+                is_ps_plus_special = True
 
-        # --- Определяем, не является ли скидка «PS Plus only» ---
-        def _has_plus_branding() -> bool:
-            for arr in (price_info.get("serviceBranding"), price_info.get("upsellServiceBranding")):
-                if arr and any("PLUS" in s for s in arr):
-                    return True
-            return False
 
-        plus_branding_flag = _has_plus_branding()
-
-        # Если есть цена со скидкой и она НЕ относится только к PS Plus ‑ используем её,
-        # иначе берём базовую.
-        price_str: str = ""
-        if disc_price_str and not plus_branding_flag:
-            price_str = disc_price_str
-        elif base_price_str:
-            price_str = base_price_str
-        elif disc_price_str:
-            price_str = disc_price_str
-
-        # --- если цены нет в HTML-JSON, пробуем GraphQL сразу ---
-        if not price_str and product.get("conceptId") and _PSN_COOKIE:
-            gql_cur, gql_val = await _fetch_price_graphql(str(product.get("conceptId")), region)
-            if gql_val is not None and gql_cur:
-                currency = gql_cur
-                price_val = gql_val
-                price_str = f"{gql_val} {gql_cur}"
-                # сразу прерываем дальнейший разбор (депозит невозможен)
-                deposit_flag = False
-            # если всё равно пусто, продолжим обычный путь (slug/HTML)
-
-        if not price_str:
-            # Пытаемся получить цену со страницы /games/<slug>
-            g_cur, g_val = await _fetch_games_price(product.get("name", ""), region)
-            if g_cur and g_val is not None:
-                currency = g_cur
-                price_val = g_val
-                price_str = f"{g_val} {g_cur}"
-            else:
-                # HTML-парсер ещё может вытащить цену ниже, не выходим досрочно
-                price_val = 0.0
-                price_str = "0"
-        currency = _currency_from_price(price_str, region)
-        # --- парсим число с помощью той же логики, что и в _collect_html_prices ---
-        cleaned = re.sub(r"[^0-9.,\s\u00A0]", "", price_str)
-        cleaned = re.sub(r"[\s\u00A0]", "", cleaned)
-
-        def _safe_parse(txt: str) -> float | None:
-            if not txt:
-                return None
-            if "," in txt and "." in txt:
-                last_dot = txt.rfind('.')
-                last_comma = txt.rfind(',')
-                if last_comma > last_dot:
-                    int_part = re.sub(r"[.,]", "", txt[:last_comma])
-                    dec_part = txt[last_comma + 1:]
-                    txt_norm = f"{int_part}.{dec_part}"
-                else:
-                    int_part = re.sub(r"[.,]", "", txt[:last_dot])
-                    dec_part = txt[last_dot + 1:]
-                    txt_norm = f"{int_part}.{dec_part}"
-            elif "," in txt:
-                last_comma = txt.rfind(',')
-                if len(txt) - last_comma - 1 == 2:
-                    int_part = txt[:last_comma].replace(',', '')
-                    dec_part = txt[last_comma + 1:]
-                    txt_norm = f"{int_part}.{dec_part}"
-                else:
-                    txt_norm = txt.replace(',', '')
-            else:
-                txt_norm = txt
-            try:
-                return float(txt_norm)
-            except ValueError:
-                return None
-
-        parsed_val = _safe_parse(cleaned)
-        if parsed_val is None:
-            logger.warning(f"[PS] cannot parse price '{price_str}' for {game_id}")
-            return []
-        price_val = parsed_val
-
-        # --- попытка уточнить через GraphQL (если есть conceptId и куки) ---
-        if product.get("conceptId") and _PSN_COOKIE:
-            gql_cur, gql_val = await _fetch_price_graphql(str(product.get("conceptId")), region)
-            if gql_val and (gql_val > price_val * 1.3):
-                price_val = gql_val
-                currency = gql_cur or currency
-                deposit_flag = False
-
-        # Если мы уже используем обычную скидочную (не Plus) цену, дополнительно проверять HTML не нужно –
-        # иначе можно случайно заменить её на старую базовую.
-        skip_html_override = (disc_price_str and price_str == disc_price_str and not plus_branding_flag)
-
-        # Если цена выглядит подозрительно низкой (депозит) и мы НЕ на скидке – сверяемся с HTML.
-        html_price_val: float | None = None
-        html_price_str: str = ""
-        try:
-            title_lc = (product.get("name" , "") or "").lower()
-            deluxe_mode = any(x in title_lc for x in ("deluxe", "ultimate", "gold", "premium", "bundle", "director"))
-
-            locale = _REGION_TO_LOCALE.get(region, "en-us")
-            html_page = None
-
-            if not skip_html_override:
-                # Сначала пробуем повторно скачать HTML
-                html_url = _PRODUCT_URL_TEMPLATE.format(locale=locale, product_id=product.get("id"))
-                html_page = await _fetch_html_proxy(html_url, region, locale)
-
-                # Если не удалось (таймаут / блокировка), берём HTML, сохранённый при _fetch_product
-                if not html_page:
-                    html_page = product.get("__html")
-
-            if html_page and not skip_html_override:
-                # Расширенный парсинг: берём максимальную цену из HTML
-                prices = _collect_html_prices(html_page, region)
-                if prices:
-                    full_price = _select_full_price(prices, currency, deluxe_mode=deluxe_mode)
-                    if full_price is not None:
-                        html_price_val = full_price
-                        # определяем валюту, соответствующую выбранной цене
-                        html_cur = currency
-                        for v, cur_sym in prices:
-                            if abs(v - full_price) < 0.01:
-                                html_cur = cur_sym
-                                break
-                        html_price_str = f"{full_price} {html_cur}"
-                        currency = html_cur
-        except Exception as _e:
-            logger.info(f"[PS] second html check error: {_e}")
-
-        if html_price_val and html_price_val > price_val * 1.5:
-            price_val = html_price_val
-            price_str = html_price_str
-            currency = _currency_from_price(price_str, region)
-            deposit_flag = False
-
-        # --- предварительная оценка: похоже на депозит? ---
-        deposit_flag = False
-
-        _DEP_THRESH = {
-            "USD": 30,
-            "UAH": 500,
-            "TRY": 500,
-            "ARS": 5000,
-            "INR": 700,
-            "KZT": 9000,
-            "BRL": 80,
-            "PLN": 100,
-            "RUB": 700,
+        return {
+            "price": final_price,
+            "currency": price_info.get("currencyCode"),
+            "discount": discount,
+            "old_price": old_price if discount > 0 and old_price > final_price else None,
+            "ps_plus_price": ps_plus_price,
+            "is_ps_plus_special": is_ps_plus_special,
+            "is_free": final_price == 0.0 and not is_included_in_plus,
+            "included_in_ps_plus": is_included_in_plus,
         }
+    except (ValueError, TypeError, KeyError) as e:
+        logger.error(
+            f"Ошибка при обработке цены для {product_id}: {e}. Price data: {price_info}"
+        )
+        return None
 
-        dep_limit = _DEP_THRESH.get(currency, None)
-        # Депозиты встречаются в основном в AR / KZ; в остальных регионах низкая цена чаще означает скидку.
-        if dep_limit and price_val < dep_limit and region in {"AR", "KZ"}:
-            deposit_flag = True
 
-        # --- спец-правило для AR / KZ: если ещё депозит и есть USD цена >30 – берём её ---
-        if deposit_flag and region in {"AR", "KZ"}:
-            usd_candidates = [v for v, cur in prices if cur == "USD" and v > 30]
-            if usd_candidates:
-                best_usd = min(usd_candidates)
-                price_val = best_usd
-                currency = "USD"
-                deposit_flag = False
+async def get_offers(game_id: str, *, region: str = "US") -> List[Tuple]:
+    """Получение офферов для игры через GraphQL.
 
-        # fallback только если подозреваем депозит && первая попытка
-        if deposit_flag and _depth == 0:
-            # Пробуем запросить тот же товар в US: там часто видна полная цена
-            us_offer = await get_offers(game_id, region="US", _depth=1)
-            if us_offer:
-                _lbl, us_price, us_cur, *_ = us_offer[0]
-                if us_price > price_val * 1.5:
-                    price_val = us_price
-                    currency = us_cur
-                    deposit_flag = False  # заменили депозит на полную цену
+    Args:
+        game_id: ID игры, например 'ps:EP1004-CUSA08519_00-REDEMPTIONFULL02'
+        region: Двухбуквенный код региона (RU, US, TR, etc.)
 
-        # Поиск альтернативных SKU (PS5-версий, Deluxe и т.д.) убран – слишком медленно
-        # и часто приводит к неверному соответствию (Director's Cut вместо On The Beach).
+    Returns:
+        Список кортежей с офферами.
+    """
+    if not game_id or not game_id.startswith("ps:"):
+        return []
+    
+    product_id = game_id.split(":", 1)[1]
+    cache_key = (product_id, region.upper())
 
-    # --- депозит (предзаказ) ---
-    # deposit_flag уже выставлен выше; можно скорректировать при необходимости
+    if cache_key in _PRODUCT_CACHE:
+        cached = _PRODUCT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
-    # --- PS Plus flag ---
-    plus_flag = False
-    for arr in (price_info.get("serviceBranding"), price_info.get("upsellServiceBranding")):
-        if arr and any("PLUS" in s for s in arr):
-            plus_flag = True
-            break
+    offers = await _fetch_price_product(product_id, region.upper())
 
-    locale = _REGION_TO_LOCALE.get(region, "en-us")
-    url = _PRODUCT_URL_TEMPLATE.format(locale=locale, product_id=product.get("id"))
+    if offers:
+        _PRODUCT_CACHE[cache_key] = offers
+    
+    return offers
 
-    # --- Цена со скидкой PS Plus (если отличается) ---
-    discount_val: float | None = None
-    if plus_flag and disc_price_str and disc_price_str != base_price_str:
-        # Парсим disc_price_str аналогично основной цене
-        _disc_raw = re.sub(r"[^0-9.,\s\u00A0]", "", disc_price_str)
-        _disc_raw = re.sub(r"[\s\u00A0]", "", _disc_raw)
-        _disc_raw = _disc_raw.replace(",", ".")
+async def get_ps_store_prices(session, game_details, country_codes):
+    logger.info(f"Начало получения цен из PS Store для '{game_details.get('name', 'Unknown Game')}'.")
+    country_codes = [code for code in country_codes if code not in ['ru', 'kz']]
+    
+    ps_prices = {}
+
+    base_product_id = game_details.get('ps_store_id')
+    invariant_name = game_details.get('invariant_name')
+
+    if not base_product_id:
+        logger.warning(f"Отсутствует ps_store_id для '{game_details.get('name', 'Unknown Game')}', пропускаем PS Store.")
+        return ps_prices
+
+    async def fetch_price(country_code, product_id):
+        lang, country = PS_REGION_CONFIG[country_code]
         try:
-            discount_val = float(_disc_raw)
-        except ValueError:
-            discount_val = None
+            price_info = await get_ps_price(session, product_id, country_code)
+            if price_info:
+                price_info['url'] = f"https://store.playstation.com/{lang}-{country.lower()}/product/{product_id}"
+                return price_info
+        except Exception as e:
+            logger.error(f"Ошибка при получении цены для {country_code} (ID: {product_id}): {e}")
+        return None
 
-    label = "PlayStation Store" if region == "RU" else f"PlayStation Store {region}"
-    tup: list = [label, price_val, currency, url, plus_flag, platforms, deposit_flag]
-    if discount_val and abs(discount_val - price_val) > 0.01:
-        tup.append(discount_val)
+    tasks = {}
+    
+    # Создаем задачи для всех стран, включая США
+    # Для США и других стран логика теперь едина: найти ID и получить цену
+    # Но для США у нас уже есть ID, а для других его нужно найти
+    
+    # Сначала для США
+    if 'us' in country_codes:
+        tasks['us'] = asyncio.create_task(fetch_price('us', base_product_id))
+        country_codes.remove('us')
 
-    return [tuple(tup)]
+    # Затем для остальных стран
+    search_tasks = {}
+    for code in country_codes:
+        lang, country = PS_REGION_CONFIG[code]
+        search_tasks[code] = asyncio.create_task(
+            search_ps_store_games_for_country(session, game_details['name'], lang, country, invariant_name or "")
+        )
+
+    # Запускаем поиск региональных ID
+    search_results = await asyncio.gather(*search_tasks.values())
+    
+    # Создаем задачи на получение цен по найденным региональным ID
+    for (code, _), country_results in zip(search_tasks.items(), search_results):
+        if country_results and country_results[0].get('id'):
+            regional_product_id = country_results[0]['id']
+            tasks[code] = asyncio.create_task(fetch_price(code, regional_product_id))
+        else:
+            logger.warning(f"Не удалось найти игру '{game_details['name']}' в регионе {code}.")
+ 
+    # Ожидаем выполнения всех задач по получению цен
+    # asyncio.gather сохраняет порядок, поэтому мы можем сопоставить результаты
+    # с кодами стран.
+    if tasks:
+        task_codes = list(tasks.keys())
+        results = await asyncio.gather(*tasks.values())
+
+        for code, result in zip(task_codes, results):
+            if result:
+                ps_prices[code] = result
+ 
+    logger.info(f"Завершено получение цен из PS Store. Найдено цен для {len(ps_prices)} регионов.")
+    return ps_prices
 
 
-async def list_editions(game_id: str, region: str = "US", limit: int = 20) -> List[Tuple[str, str]]:
-    """Возвращает список (game_id, title) альтернативных изданий той же игры.
+async def get_ps_price(session, product_id, country_code):
+    lang, country = PS_REGION_CONFIG[country_code]
+    product_data = await _fetch_price_product(product_id, country_code)
 
-       Алгоритм простой:
-        1. Получаем название базового товара (через кэш/запрос).
-        2. Выполняем search_games по этому названию – PlayStation в поисковой выдаче обычно
-           показывает все связанные SKU (Standard, Deluxe, Bundle, Director's Cut и т.д.).
-        3. Ограничиваем количество результатов параметром *limit*.
+    if not product_data or not product_data.get("webctas"):
+        logger.warning(
+            f"Не найдены CTA для product_id: {product_id} в регионе {country_code}"
+        )
+        return None
 
-        В ответе только id и заголовок – подробности (цена и т.д.) будут получены позднее
-        через get_offers для конкретного выбора пользователя.
-        """
-    if not game_id.startswith("ps:"):
-        return []
+    purchase_cta = None
+    catalog_cta = None
+    download_cta = None
+    
+    # 1. Ищем основные типы предложений
+    for cta in product_data["webctas"]:
+        cta_type = cta.get("type")
+        if cta_type in ["ADD_TO_CART", "PRE_ORDER"]:
+            purchase_cta = cta
+        elif cta_type == "UPSELL_PS_PLUS_GAME_CATALOG":
+            catalog_cta = cta
+        elif cta_type == "DOWNLOAD":
+            download_cta = cta
+    
+    # 2. Выбираем основной оффер для определения цены
+    main_cta = purchase_cta or catalog_cta or download_cta
+    
+    if not main_cta or not main_cta.get("price"):
+        logger.warning(
+            f"Не удалось найти основной оффер с ценой для {product_id} в {country_code}. CTAs: {product_data['webctas']}"
+        )
+        return None
+        
+    price_info = main_cta.get("price")
+    
+    # Если есть и покупка, и каталог, цена покупки приоритетнее
+    if purchase_cta and purchase_cta.get("price"):
+        price_info = purchase_cta.get("price")
 
-    region = region.upper()
-    cache_key = (region, game_id)
-    product = _PRODUCT_CACHE.get(cache_key)
-    if product is None:
-        pid = game_id.split(":", 1)[1]
-        product = await _fetch_product(pid, region)
-        if product:
-            _PRODUCT_CACHE[cache_key] = product
-    if not product:
-        return []
+    # 3. Парсим информацию о цене
+    try:
+        currency_code = price_info.get("currencyCode") or ""
+        divisor = 1 if currency_code in _NO_DECIMAL_CURRENCIES else 100
 
-    base_title: str = product.get("name", "")
-    if not base_title:
-        return []
+        base_price_value = price_info.get("basePriceValue", 0)
+        discounted_value = price_info.get("discountedValue", 0)
+        
+        # Для игр из каталога цена покупки может быть в basePrice, а discounted - 0 ("Included")
+        if catalog_cta and not purchase_cta:
+             # Если игра только в каталоге, ее цена покупки - это basePrice, а цена по подписке - 0
+             final_price = 0.0
+             old_price = base_price_value / divisor if base_price_value else 0.0
+        else:
+            final_price = discounted_value / divisor
+            old_price = base_price_value / divisor
+        
+        discount = 0
+        if old_price > 0 and final_price < old_price:
+            discount = round(100 - (final_price * 100 / old_price))
+        
+        # Определяем, включена ли игра в PS Plus
+        is_included_in_plus = catalog_cta is not None and (final_price == 0.0 or "Included" in (price_info.get("discountText") or ""))
 
-    # Выполняем поиск
-    candidates = await search_games(base_title, region=region, limit=limit)
+        # Ищем отдельную скидку для подписчиков PS Plus
+        ps_plus_price = None
+        is_ps_plus_special = False
+        plus_discount_cta = next((c for c in product_data["webctas"] if c.get("type") == "UPSELL_PS_PLUS_DISCOUNT" and c.get("price")), None)
+        if plus_discount_cta:
+            plus_price_info = plus_discount_cta["price"]
+            plus_discounted_value = plus_price_info.get("discountedValue")
+            if plus_discounted_value is not None:
+                ps_plus_price = plus_discounted_value / 100
+                is_ps_plus_special = True
 
-    # Некоторые результаты могут совпадать с исходным id – подвинем его в начало списка
-    # и уберём точные дубликаты.
-    seen: set[str] = set()
-    editions: list[Tuple[str, str]] = []
-    for gid, title in candidates:
-        if gid in seen:
-            continue
-        seen.add(gid)
-        editions.append((gid, title))
 
-    # Перемещаем базовый id в начало (если есть)
-    for i, (gid, _t) in enumerate(editions):
-        if gid == game_id:
-            base = editions.pop(i)
-            editions.insert(0, base)
-            break
-
-    return editions 
+        return {
+            "price": final_price,
+            "currency": price_info.get("currencyCode"),
+            "discount": discount,
+            "old_price": old_price if discount > 0 and old_price > final_price else None,
+            "ps_plus_price": ps_plus_price,
+            "is_ps_plus_special": is_ps_plus_special,
+            "is_free": final_price == 0.0 and not is_included_in_plus,
+            "included_in_ps_plus": is_included_in_plus,
+        }
+    except (ValueError, TypeError, KeyError) as e:
+        logger.error(
+            f"Ошибка при обработке цены для {product_id}: {e}. Price data: {price_info}"
+        )
+        return None 

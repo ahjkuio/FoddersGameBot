@@ -1,6 +1,8 @@
 from collections import defaultdict
 from typing import List, Tuple, Dict, Any
 import asyncio
+import re  # для безопасного удаления HTML-тегов
+import aiohttp  # для PS Store fallback
 
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramBadRequest
@@ -22,11 +24,15 @@ from telegram_videogame_bot.prices_keyboards import (
     cancel_keyboard,
     offers_keyboard
 )
-from telegram_videogame_bot.prices_func import convert_to_rub
+from telegram_videogame_bot.prices_func import convert_currency
 
 router = Router()
 
 GAMES_PER_PAGE = 15
+
+# Создаём словарь с флагами для регионов для красивого отображения
+REGION_FLAGS = {code: name.split(" ")[0] for code, name in REGIONS}
+
 
 class PriceStates(StatesGroup):
     waiting_for_platforms = State()
@@ -161,6 +167,21 @@ async def confirm_regions(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def get_ps_regional_price(concept_id: str, region: str) -> tuple[str, dict | None]:
+    """
+    Получает цену для PS Store в определенном регионе, используя conceptId.
+    Возвращает кортеж (использованный_id, данные_о_цене).
+    """
+    regional_product_id = await ps_store.get_product_id_from_concept(concept_id, region)
+    
+    if not regional_product_id:
+        logger.warning(f"Не удалось найти regional_product_id для concept_id {concept_id} в регионе {region}")
+        return f"concept:{concept_id}", None
+
+    price_data = await ps_store.get_product_price(regional_product_id, region)
+    return regional_product_id, price_data
+
+
 async def show_prices_for_game(
     editable_message: types.Message, state: FSMContext, game_group: Dict[str, Any], game_index: int
 ):
@@ -173,192 +194,251 @@ async def show_prices_for_game(
     data = await state.get_data()
     selected_title = game_group["title"]
     game_ids = game_group["ids"]
+    ps_concept_id = game_group.get("ps_concept_id")
 
     regions_sel: set = data.get("regions", {"RU"})
-    platforms: set = data.get("platforms", set())
-
+    
     # --- Получение цен для найденных игр ---
     offer_tasks = []
     task_meta = []  # (store_name, region)
 
+    ps_fallback_prices: Dict[str, dict] | None = None  # Цены из новой логики (без conceptId)
+
+    # Определяем, какие регионы реально запрашивать для PS
+    ps_regions_to_fetch = set(regions_sel)
+    remap_ru_kz = "RU" in ps_regions_to_fetch or "KZ" in ps_regions_to_fetch
+    if remap_ru_kz:
+        ps_regions_to_fetch.discard("RU")
+        ps_regions_to_fetch.discard("KZ")
+        ps_regions_to_fetch.add("US")  # Убедимся, что US будет запрошен
+
     for store_name, game_id in game_ids.items():
-        for reg in regions_sel:
-            # GOG отдаёт одну цену, нет смысла запрашивать другие регионы
-            if store_name == "gog" and reg != "RU":
+        if store_name == "ps":
+            if not ps_concept_id:
+                # --- Новый fallback: используем product_id и invariant_name ---
+                base_product_id = game_id
+                if base_product_id.startswith("ps:"):
+                    base_product_id = base_product_id[3:]
+
+                invariant_name = game_group.get("ps_invariant_name")
+                game_details = {
+                    "name": selected_title,
+                    "ps_store_id": base_product_id,
+                    "invariant_name": invariant_name,
+                }
+
+                ps_region_codes = [c.lower() for c in ps_regions_to_fetch]
+
+                # Запускаем в отдельной задаче с собственным ClientSession, чтобы не блокировать другие
+                async def _get_fallback_prices():
+                    async with aiohttp.ClientSession() as session:
+                        return await ps_store.get_ps_store_prices(session, game_details, ps_region_codes)
+
+                offer_tasks.append(_get_fallback_prices())
+                task_meta.append(("ps_fallback", "ALL"))
                 continue
-            if store_name == "steam":
-                offer_tasks.append(steam_store.get_offers(game_id, reg))
-            elif store_name == "epic":
-                offer_tasks.append(epic_store.get_offers(game_id, reg))
-            elif store_name == "gog":
-                offer_tasks.append(gog_store.get_offers(game_id, reg))
-            # elif store_name == "origin":
-            #     offer_tasks.append(origin_store.get_offers(game_id, reg))
-            elif store_name == "ms":
-                offer_tasks.append(ms_store.get_offers(game_id, reg))
-            elif store_name == "ps":
-                offer_tasks.append(ps_store.get_offers(game_id, reg))
-            task_meta.append((store_name, reg))
+            # --- Старый путь через conceptId ---
+            for reg in ps_regions_to_fetch:
+                offer_tasks.append(get_ps_regional_price(ps_concept_id, reg))
+                task_meta.append((store_name, reg))
+        else:
+            # Для остальных магазинов логика прежняя
+            for reg in regions_sel:
+                if store_name == "gog" and reg != "RU":
+                    continue
+                
+                module_map = {
+                    "steam": steam_store, "epic": epic_store, 
+                    "gog": gog_store, "ms": ms_store
+                }
+                if store_name in module_map:
+                    offer_tasks.append(module_map[store_name].get_offers(game_id, reg))
+                    task_meta.append((store_name, reg))
 
     # --- Обработка и отображение результатов ---
     price_results = await asyncio.gather(*offer_tasks, return_exceptions=True)
 
-    async def fmt_price(p: float, cur: str) -> str:
-        if cur == "FREE":
-            return "<b>Бесплатно</b>"
-        rub_price_str = ""
-        if cur not in ["RUB", "Р", "₽"]:
-            rub_price = await convert_to_rub(p, cur)
-            if rub_price:
-                rub_price_str = f" (<i>~{int(rub_price)} ₽</i>)"
-        price_str = f"{p:g}" if cur in ["RUB", "Р", "₽"] else f"{p:.2f}"
-        return f"<b>{price_str} {cur}</b>{rub_price_str}"
-
     # --- Группируем по магазину/региону ---
-    store_region: dict[str, dict[str, tuple]] = defaultdict(dict)
+    store_region: dict[str, dict[str, list | dict]] = defaultdict(dict)
+    ps_regional_ids = {}  # Для хранения региональных ID PS игр
     for (store, reg), result in zip(task_meta, price_results):
         if isinstance(result, Exception):
             logger.error(f"Ошибка получения цены {store} {reg}: {result}")
             continue
         if result:
-            offer = result[0]
-            store_region[store][reg] = offer
+            if store == "ps_fallback":
+                # result – это dict region→price_info
+                ps_fallback_prices = result  # сохраним для дальнейшей обработки
+                for reg_code, price_info in result.items():
+                    up_reg = reg_code.upper()
+                    store_region["ps"][up_reg] = price_info
+                    # Извлекаем product_id из URL
+                    prod_id = price_info.get("url", "").split("/")[-1]
+                    if prod_id:
+                        ps_regional_ids[up_reg] = f"ps:{prod_id}"
+            elif store == "ps":
+                regional_id, price_data = result
+                if price_data:
+                    store_region[store][reg] = price_data
+                    ps_regional_ids[reg] = regional_id
+            else:
+                store_region[store][reg] = result
 
-    if not store_region:
+    # Для PS Store копируем данные из US в RU/KZ, если требуется
+    if remap_ru_kz and "ps" in store_region and "US" in store_region["ps"]:
+        us_offers = store_region["ps"].get("US")
+        us_id = ps_regional_ids.get("US")
+        if us_offers:
+            if "RU" in regions_sel:
+                store_region["ps"]["RU"] = us_offers
+                if us_id: ps_regional_ids["RU"] = us_id
+            if "KZ" in regions_sel:
+                store_region["ps"]["KZ"] = us_offers
+                if us_id: ps_regional_ids["KZ"] = us_id
+
+    if not any(store_region.values()):
         await editable_message.edit_text(
             f"Не удалось найти актуальные цены для <b>{selected_title}</b>.",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard(),
+            reply_markup=offers_keyboard(game_index),
         )
         return
 
     # Дополняем магазины, чтобы отображались только релевантные
-    selected_stores = set(store_region.keys())
-    # Если у игры есть id в game_ids, но офферов нет (например, недоступен регион)—добавим пустую запись
     for _sn in game_ids.keys():
         store_region.setdefault(_sn, {})
 
-    # Prefetch курсов валют, чтобы ускорить convert_to_rub
-    from telegram_videogame_bot.prices_func import _fetch_rate_to_rub  # type: ignore
+    async def fmt_price(p: float, cur: str) -> str:
+        """Универсальный форматер цен с конвертацией в рубли."""
+        if cur is None or p is None: return ""
+        if cur == "FREE" or p == 0.0: return "<b>Бесплатно</b>"
+        if cur in ["RUB", "Р", "₽", "INR", "JPY", "KRW", "HUF", "CLP", "VND"]:
+            price_str = f"{int(round(p))}"
+        else:
+            price_str = f"{p:.2f}"
+        main_price_formatted = f"<b>{price_str} {CURRENCY_SYMBOLS.get(cur, cur)}</b>"
+        conv_price_str = ""
+        if cur.upper() != 'RUB':
+            converted = await convert_currency(p, cur, 'RUB')
+            if converted:
+                conv_price_str = f" (<i>~{int(converted)} ₽</i>)"
+        return main_price_formatted + conv_price_str
 
-    # собираем все валюты, которые не RUB/FREE
-    cur_set = set()
-    for off_dict in store_region.values():
-        for _reg, offer in off_dict.items():
-            _sn, _price, cur, *_ = offer
-            if cur not in ["RUB", "Р", "₽", "FREE"]:
-                cur_set.add(cur)
+    async def get_sort_price(store_name: str, offer_data: dict | list) -> float:
+        """Рассчитывает цену для сортировки (в рублях)."""
+        if not offer_data: return float('inf')
+        
+        final_price, currency, is_catalog = float('inf'), None, False
 
-    if cur_set:
-        await asyncio.gather(*[_fetch_rate_to_rub(c) for c in cur_set])
+        if store_name == 'ps' and isinstance(offer_data, dict):
+            final_price = offer_data.get("price", float('inf'))
+            currency = offer_data.get("currency")
+            is_catalog = offer_data.get("included_in_ps_plus", False)
+        elif isinstance(offer_data, list):
+            try:
+                offer = offer_data[0]
+                price = offer[1]
+                currency = offer[2]
+                
+                # Безопасно получаем доп. поля
+                is_catalog = offer[7] if len(offer) > 7 else False
+                discount_val = offer[8] if len(offer) > 8 else None
+                
+                final_price = discount_val if discount_val is not None and discount_val < price else price
+            except (ValueError, IndexError):
+                return float('inf')
 
-    # --- Вычисляем среднюю цену (в рубляx) для сортировки магазинов ---
-    async def avg_rub(offers_dict):
-        rubs = []
-        for reg, offer in offers_dict.items():
-            _sn, price, cur, *_ = offer
-            rub = price if cur in ["RUB", "Р", "₽"] else await convert_to_rub(price, cur)
-            if rub is not None:
-                rubs.append(rub)
-        return sum(rubs) / len(rubs) if rubs else float("inf")
+        if is_catalog and final_price == 0.0: return 0.0
+        if currency is None or final_price is None or final_price == float('inf'): return float('inf')
+        if currency.upper() in ["RUB", "Р", "₽", "FREE"]: return final_price if currency != "FREE" else 0.0
+        rub_price = await convert_currency(final_price, currency, "RUB")
+        return rub_price if rub_price is not None else float('inf')
+    
+    # --- Рендер сообщения ---
+    async def _render_store_prices(store_name: str, offers_by_region: dict) -> str:
+        lines = [f"<b>{STORE_DISPLAY.get(store_name, store_name.title())}:</b>"]
+        if not offers_by_region:
+            lines.append("  <i>Нет предложений</i>")
+            return "\n".join(lines)
 
-    store_avg = {store: await avg_rub(off_dict) for store, off_dict in store_region.items()}
-    stores_sorted = sorted(store_region.keys(), key=lambda s: store_avg[s])
+        sorting_prices = {reg: await get_sort_price(store_name, o) for reg, o in offers_by_region.items()}
+        sorted_regions = sorted(offers_by_region.items(), key=lambda item: sorting_prices.get(item[0], float('inf')))
 
-    # --- Форматируем вывод ---
-    lines = []
-    flag_map = {
-        "RU": "🇷🇺", "TR": "🇹🇷", "AR": "🇦🇷", "BR": "🇧🇷", "US": "🇺🇸",
-        "IN": "🇮🇳", "UA": "🇺🇦", "KZ": "🇰🇿", "PL": "🇵🇱",
-    }
+        for reg, offers in sorted_regions:
+            if not offers: continue
+            
+            flag = REGION_FLAGS.get(reg, "❔")
+            price_line_parts = [f"  {flag} <b>{reg}:</b>"]
+            url = ""
 
-    for store in stores_sorted:
-        off_dict = store_region[store]
-        rub_pairs = []
-        for reg in regions_sel:
-            if reg in off_dict:
-                _sn, price, cur, *_ = off_dict[reg]
-                rub_val = price if cur in ["RUB", "Р", "₽"] else await convert_to_rub(price, cur)
-                rub_pairs.append((reg, rub_val if rub_val is not None else float("inf")))
-            else:
-                rub_pairs.append((reg, float("inf")))
+            if store_name == 'ps':
+                price_info = offers
+                
+                # Используем региональный ID, если он есть
+                product_id = ps_regional_ids.get(reg, game_ids.get("ps", ""))
+                if product_id.startswith("ps:"):
+                    product_id = product_id[3:]
+                    
+                url = f"https://store.playstation.com/{ps_store._REGION_TO_LOCALE.get(reg, 'en-us')}/product/{product_id}"
+                
+                price, currency = price_info['price'], price_info['currency']
+                old_price, ps_plus_price = price_info.get('old_price'), price_info.get('ps_plus_price')
+                is_included = price_info.get('included_in_ps_plus')
 
-        region_sorted = [r for r, _ in sorted(rub_pairs, key=lambda x: x[1])]
-        region_parts = []
-        for reg in region_sorted:
-            if reg in off_dict:
-                _sn, price, cur, url, *rest = off_dict[reg]
-                plus_flag = rest[0] if rest else False
-
-                # --- подписочные варианты ---
-                if plus_flag and store == "ms" and price <= 0.01:
-                    price_str = "В подписке"
-                elif price <= 0.01 and store == "ps" and plus_flag:
-                    price_str = "PS Plus"
+                price_fmt = await fmt_price(price, currency)
+                
+                if is_included:
+                    price_line_parts.append(f'<a href="{url}">Бесплатно в PS Plus</a>')
+                    if price > 0: price_line_parts.append(f'(или {price_fmt})')
+                elif old_price and old_price > price:
+                    old_price_fmt = f"<s>{old_price:g} {CURRENCY_SYMBOLS.get(currency, currency)}</s>"
+                    price_line_parts.append(f'<a href="{url}">{old_price_fmt} {price_fmt}</a>')
+                elif ps_plus_price and ps_plus_price < price:
+                     ps_plus_price_fmt = await fmt_price(ps_plus_price, currency)
+                     price_line_parts.append(f'<a href="{url}">{price_fmt}</a> (PS+: {ps_plus_price_fmt})')
                 else:
-                    price_str = await fmt_price(price, cur)
+                    price_line_parts.append(f'<a href="{url}">{price_fmt}</a>')
+            else: # Другие магазины
+                try:
+                    offer = offers[0]
+                    label, price, currency, url = offer[0], offer[1], offer[2], offer[3]
+                    discount_val = offer[4] if len(offer) > 4 and offer[4] is not None else None
+                    is_plus = False # Для PC нерелевантно в данном контексте
+                    deposit_flag = False # Аналогично
+                except (ValueError, IndexError):
+                    logger.warning(f"Не удалось распаковать оффер для {store_name}: {offers[0]}")
+                    continue
+                
+                if currency == "FREE": price_line_parts.append(f'<a href="{url}">Бесплатно</a>')
+                elif deposit_flag: price_line_parts.append(f'<a href="{url}">Предзаказ</a> ({await fmt_price(price, currency)})')
+                elif discount_val is not None and discount_val < price:
+                    old_price_fmt = f"<s>{price:g} {currency}</s>"
+                    new_price_fmt = await fmt_price(discount_val, currency)
+                    price_line_parts.append(f'<a href="{url}">{old_price_fmt} {new_price_fmt}</a>')
+                else: price_line_parts.append(f'<a href="{url}">{await fmt_price(price, currency)}</a>')
+            
+            lines.append(" ".join(price_line_parts))
+        return "\n".join(lines)
 
-                # --- подписка: Game Pass или PS Plus ---
-                sub_suffix = ""
-                if len(off_dict[reg]) >= 5:
-                    if store == "ms" and off_dict[reg][4]:
-                        # Если передана скидка в 7-м элементе — показываем обе цены
-                        if len(off_dict[reg]) >= 7 and off_dict[reg][6]:
-                            disc_val = off_dict[reg][6]
-                            disc_str = await fmt_price(disc_val, cur)
-                            price_str = f"{price_str} (С Game Pass {disc_str})"
-                            sub_suffix = ""  # уже указали
-                        else:
-                            sub_suffix = " <i>(в Game Pass)</i>"
-                    elif store == "ps" and off_dict[reg][4]:
-                        # Если передана цена со скидкой – показываем обе
-                        if len(off_dict[reg]) >= 8 and off_dict[reg][7]:
-                            disc_val = off_dict[reg][7]
-                            disc_str = await fmt_price(disc_val, cur)
-                            price_str = f"{price_str} (PS Plus {disc_str})"
-                            sub_suffix = ""
-                        else:
-                            sub_suffix = " <i>(PS Plus)</i>"
+    # --- Сортировка магазинов по средней цене ---
+    store_avg_prices = {}
+    for store_name, offers_by_region in store_region.items():
+        region_prices = [await get_sort_price(store_name, o) for o in offers_by_region.values() if o]
+        valid_prices = [p for p in region_prices if p != float('inf')]
+        store_avg_prices[store_name] = sum(valid_prices) / len(valid_prices) if valid_prices else float('inf')
+    
+    # --- Финальное сообщение ---
+    price_details = []
+    sorted_stores = sorted(store_region.items(), key=lambda item: store_avg_prices.get(item[0], float('inf')))
 
-                # --- совместимость платформ ---
-                hw_suffix = ""
-                if store == "ms":
-                    hardware = off_dict[reg][5] if len(off_dict[reg]) >= 6 else []
-                    if "xbox_one" in platforms and "XboxOne" not in hardware and "XboxSeries" in hardware:
-                        pass
-                    if "xbox_one" in platforms and "XboxOne" not in hardware:
-                        hw_suffix = " <i>(Series only)</i>"
-                    elif "xbox_series" in platforms and not any(h.startswith("XboxSeries") for h in hardware):
-                        hw_suffix = " <i>(One only)</i>"
-                elif store == "ps":
-                    hardware = off_dict[reg][5] if len(off_dict[reg]) >= 6 else []
-                    if "ps4" in platforms and "PS4" not in hardware and "ps5" in platforms:
-                        pass
-                    if "ps4" in platforms and "PS4" not in hardware:
-                        hw_suffix = " <i>(PS5 only)</i>"
-                    elif "ps5" in platforms and "PS5" not in hardware:
-                        hw_suffix = " <i>(PS4 only)</i>"
+    for store, offers_by_reg in sorted_stores:
+        price_details.append(await _render_store_prices(store, offers_by_reg))
 
-                # Избегаем дублирования пометки, когда игра уже «В подписке»
-                if store == "ms" and price_str == "В подписке":
-                    sub_suffix = ""
-
-                # --- депозит для предзаказов в PlayStation Store ---
-                deposit_suffix = ""
-                if store == "ps" and len(off_dict[reg]) >= 7 and off_dict[reg][6]:
-                    deposit_suffix = " <i>(депозит)</i>"
-
-                region_parts.append(f"{flag_map.get(reg, reg)} <a href='{url}'>{price_str}{sub_suffix}{deposit_suffix}{hw_suffix}</a>")
-            else:
-                region_parts.append(f"{flag_map.get(reg, reg)} 🚫")
-        display = STORE_DISPLAY.get(store, store.capitalize())
-        regions_text = "\n   " + "\n   ".join(region_parts)
-        lines.append(f"• <b>{display}</b>:" + regions_text)
-
-    text = f"💰 Актуальные цены для <b>{selected_title}</b>:\n\n" + "\n".join(lines)
+    msg_text = f"✅ <b>{selected_title}</b>\n\n" + "\n\n".join(price_details)
+    msg_text = re.sub(r'\n{3,}', '\n\n', msg_text).strip()
+    
     await editable_message.edit_text(
-        text, parse_mode="HTML", disable_web_page_preview=True,
-        reply_markup=offers_keyboard(str(game_index))
+        msg_text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=offers_keyboard(game_index),
     )
     await state.set_state(PriceStates.showing_prices)
     return
@@ -374,6 +454,9 @@ async def process_search_name(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, введите название для поиска.")
         return
 
+    # Сохраняем исходный запрос для будущего использования в PS Store
+    await state.update_data(user_query=message.text)
+    
     await message.answer("⏳ Ищу игры во всех магазинах...")
 
     # Дисклеймер о кириллице
@@ -385,8 +468,9 @@ async def process_search_name(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     platforms: set = data.get("platforms", set())
-    regions_sel: set = data.get("regions", {"RU"})
-    primary_region = next(iter(regions_sel))
+    
+    # Всегда используем 'US' как основной регион для поиска, чтобы получать английские названия
+    primary_region_for_search = "US"
     
     tasks: list = []
     store_names: list[str] = []
@@ -399,20 +483,20 @@ async def process_search_name(message: types.Message, state: FSMContext):
         tasks.append(steam_store.search_games(message.text))
         store_names.append("steam")
 
-        tasks.append(epic_store.search_games(message.text, primary_region))
+        tasks.append(epic_store.search_games(message.text, primary_region_for_search))
         store_names.append("epic")
 
-        tasks.append(gog_store.search_games(message.text, primary_region))
+        tasks.append(gog_store.search_games(message.text, primary_region_for_search))
         store_names.append("gog")
 
     # Xbox Store поддерживает PC и консоли
     if pc_selected or xbox_selected:
-        tasks.append(ms_store.search_games(message.text, region=primary_region))
+        tasks.append(ms_store.search_games(message.text, region=primary_region_for_search))
         store_names.append("ms")
 
     # PlayStation Store
     if ps_selected:
-        tasks.append(ps_store.search_games(message.text, region=primary_region))
+        tasks.append(ps_store.search_games(message.text, region=primary_region_for_search))
         store_names.append("ps")
 
     if not tasks:
@@ -431,8 +515,14 @@ async def process_search_name(message: types.Message, state: FSMContext):
         else:
             display_name = STORE_DISPLAY.get(store_name, store_name.capitalize())
             logger.info(f"Найдено {len(result)} игр в {display_name} по запросу '{message.text}'.")
-            for game_id, title in result:
-                all_games.append((store_name, game_id, title))
+            # Теперь search_games возвращает (game_id, title, concept_id, invariant_name)
+            for item in result:
+                if len(item) == 4: # PS Store
+                    game_id, title, concept_id, invariant_name = item
+                    all_games.append((store_name, game_id, title, concept_id, invariant_name))
+                else: # Другие магазины
+                    game_id, title = item
+                    all_games.append((store_name, game_id, title, None, None))
 
     if not all_games:
         await message.answer(
@@ -559,10 +649,11 @@ async def price_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-def group_games_by_title(games: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
+def group_games_by_title(games: List[Tuple[str, str, str, str | None, str | None]]) -> List[Dict[str, Any]]:
     """Группирует товары по названию так, чтобы:
     • одна и та же игра из разных магазинов склеивалась,
-    • но отдельные издания (DLC / Deluxe / Bundle / Nightreign …) оставались разными кнопками.
+    • но отдельные издания (DLC / Deluxe / Bundle / ...) оставались разными кнопками.
+    Также сохраняет ps_invariant_name и ps_concept_id для группы.
     """
     if not games:
         return []
@@ -583,7 +674,7 @@ def group_games_by_title(games: List[Tuple[str, str, str]]) -> List[Dict[str, An
 
     groups: Dict[Tuple[frozenset, frozenset], Dict[str, Any]] = {}
 
-    for store, game_id, title in games:
+    for store, game_id, title, concept_id, invariant_name in games:
         if not title:
             continue
 
@@ -597,11 +688,22 @@ def group_games_by_title(games: List[Tuple[str, str, str]]) -> List[Dict[str, An
 
         if key not in groups:
             groups[key] = {"title": title, "ids": {store: game_id}}
+            if store == "ps":
+                if invariant_name:
+                    groups[key]["ps_invariant_name"] = invariant_name
+                if concept_id:
+                    groups[key]["ps_concept_id"] = concept_id
         else:
             # При конфликте названий выбираем более длинное (часто полное)
             if len(title) > len(groups[key]["title"]):
                 groups[key]["title"] = title
             groups[key]["ids"].setdefault(store, game_id)
+            # Добавляем инварианты, если их еще нет
+            if store == "ps":
+                if invariant_name and "ps_invariant_name" not in groups[key]:
+                    groups[key]["ps_invariant_name"] = invariant_name
+                if concept_id and "ps_concept_id" not in groups[key]:
+                    groups[key]["ps_concept_id"] = concept_id
 
     # Приводим к списку
     return sorted(groups.values(), key=lambda x: x["title"].lower()) 

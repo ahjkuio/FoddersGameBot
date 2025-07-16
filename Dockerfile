@@ -17,9 +17,6 @@ COPY seed/personalAk_database.db /tmp/personalAk_database.db
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Указываем Volume (Railway сам смонтирует его в /data)
-VOLUME ["/data"]
-
 # Переходим внутрь директории бота
 WORKDIR /app/telegram_videogame_bot
 

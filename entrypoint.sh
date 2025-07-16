@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# Используем Railway переменную или дефолтный путь
 MOUNT_PATH="${RAILWAY_VOLUME_MOUNT_PATH:-/data}"
 DB_PATH="$MOUNT_PATH/personalAk_database.db"
 
@@ -11,4 +10,4 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 
 export DB_PATH="$DB_PATH"
-python telegram_videogame_bot/main.py 
+python main.py 

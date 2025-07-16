@@ -57,6 +57,7 @@ PLATFORMS = [
     ("xbox_series", "Xbox Series S|X"),
     ("xbox_one", "Xbox One"),
     ("switch", "Nintendo Switch"),
+    ("switch2", "Nintendo Switch 2"),
 ]
 
 REGIONS = [

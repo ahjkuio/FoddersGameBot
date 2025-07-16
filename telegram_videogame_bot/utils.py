@@ -2,7 +2,7 @@
 from aiogram import Bot
 from aiogram.types import Message
 from aiogram.enums.chat_member_status import ChatMemberStatus
-import config
+from telegram_videogame_bot import config
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     try:

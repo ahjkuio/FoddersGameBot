@@ -12,11 +12,16 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Копируем все исходники, включая seed
-COPY . .
+# Копируем базу и entrypoint
+COPY seed/personalAk_database.db /tmp/personalAk_database.db
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Указываем Volume (Railway сам смонтирует его в /data)
+VOLUME ["/data"]
 
 # Переходим внутрь директории бота
 WORKDIR /app/telegram_videogame_bot
 
 # Команда запуска
-CMD ["python", "main.py"] 
+CMD ["/entrypoint.sh"] 

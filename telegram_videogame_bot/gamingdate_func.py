@@ -3,8 +3,10 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import aiosqlite
 import logging
+import os
 
-DATABASE_URL = 'seed/personalAk_database.db'
+# DATABASE_URL = 'seed/personalAk_database.db'
+DATABASE_URL = os.getenv("DB_PATH", "seed/personalAk_database.db")
 
 async def find_potential_friends(user_data, viewed_users):
     user_id, username, gender, age, city, photos, favorite_games, description, profile_link, display_status, preferred_gender, likes = user_data

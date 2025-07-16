@@ -12,8 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from loguru import logger
 from fuzzywuzzy import fuzz, process
 
-# Добавляем PlayStation Store
-from telegram_videogame_bot import epic_store, gog_store, steam_store, ms_store, ps_store, utils
+# Добавляем PlayStation Store и Nintendo eShop
+from telegram_videogame_bot import epic_store, gog_store, steam_store, ms_store, ps_store, nintendo_eshop_api, utils
 # from telegram_videogame_bot import origin_store
 from telegram_videogame_bot.base_keyboards import inline_menu_keyboard
 from telegram_videogame_bot.prices_keyboards import (
@@ -61,6 +61,8 @@ STORE_DISPLAY = {
     "gog": "GOG",
     "ms": "Xbox Store",
     "ps": "PlayStation Store",
+    "nintendo": "Nintendo eShop",
+    "nintendo_switch2": "Nintendo eShop (Switch 2)",
 }
 
 
@@ -197,10 +199,12 @@ async def show_prices_for_game(
     ps_concept_id = game_group.get("ps_concept_id")
 
     regions_sel: set = data.get("regions", {"RU"})
-    
+
     # --- Получение цен для найденных игр ---
     offer_tasks = []
     task_meta = []  # (store_name, region)
+
+    logger.info(f"game_ids для выбранной игры: {game_ids}")
 
     ps_fallback_prices: Dict[str, dict] | None = None  # Цены из новой логики (без conceptId)
 
@@ -240,7 +244,7 @@ async def show_prices_for_game(
             # --- Старый путь через conceptId ---
             for reg in ps_regions_to_fetch:
                 offer_tasks.append(get_ps_regional_price(ps_concept_id, reg))
-                task_meta.append((store_name, reg))
+            task_meta.append((store_name, reg))
         else:
             # Для остальных магазинов логика прежняя
             for reg in regions_sel:
@@ -254,6 +258,47 @@ async def show_prices_for_game(
                 if store_name in module_map:
                     offer_tasks.append(module_map[store_name].get_offers(game_id, reg))
                     task_meta.append((store_name, reg))
+                elif store_name in ["switch", "switch2", "nintendo", "nintendo_switch"]:
+                    # Nintendo eShop — поиск и цены через новый API
+                    from telegram_videogame_bot.nintendo_eshop_api import nintendo_api
+                    async def nintendo_offers():
+                        try:
+                            logger.info(f"[Nintendo] Получение цен для: {selected_title}, game_id: {game_id}, регионы: {list(regions_sel)}")
+                            # Поиск игры по названию
+                            games = await nintendo_api.search_games(selected_title)
+                            logger.info(f"[Nintendo] search_games вернул: {games}")
+                            if not games:
+                                logger.warning(f"[Nintendo] Не найдено игр для: {selected_title}")
+                                return None
+                            # Берём первую подходящую игру
+                            game = games[0]
+                            # Получаем цены по регионам
+                            prices = await nintendo_api.get_prices(game.nsuid, list(regions_sel))
+                            logger.info(f"[Nintendo] get_prices вернул: {prices}")
+                            # Fallback на US
+                            us_price = prices.get("US")
+                            offers = {}
+                            for reg in regions_sel:
+                                offer = nintendo_api.parse_price(prices.get(reg, {}), us_price)
+                                logger.info(f"[Nintendo] parse_price для региона {reg}: {offer}")
+                                if offer:
+                                    offers[reg] = offer | {
+                                        "url": f"https://www.nintendo.com/store/products/{game.nsuid}",
+                                        "title": game.title,
+                                        "platform": game.platform,
+                                        "price": float(offer["raw_value"]) if "raw_value" in offer and offer["raw_value"] else None,
+                                        "regular": offer["regular"] if "regular" in offer else str(offer["raw_value"]) if "raw_value" in offer else None,
+                                        "discount": offer.get("discount"),
+                                        "discount_end": offer.get("discount_end")
+                                    }
+                            logger.info(f"[Nintendo] Итоговые offers: {offers}")
+                            return offers
+                        except Exception as e:
+                            logger.error(f"[Nintendo] Ошибка в nintendo_offers: {e}")
+                            import traceback; traceback.print_exc()
+                            return None
+                    offer_tasks.append(nintendo_offers())
+                    task_meta.append((f"nintendo_{store_name}", "ALL"))
 
     # --- Обработка и отображение результатов ---
     price_results = await asyncio.gather(*offer_tasks, return_exceptions=True)
@@ -281,6 +326,32 @@ async def show_prices_for_game(
                 if price_data:
                     store_region[store][reg] = price_data
                     ps_regional_ids[reg] = regional_id
+            elif store.startswith("nintendo_"):
+                # Обработка результатов Nintendo eShop
+                if result and isinstance(result, list):
+                    # result - список NintendoGame объектов
+                    for game in result:
+                        if game.price is not None:
+                            # Создаем формат, совместимый с другими магазинами
+                            nintendo_offer = {
+                                "price": game.price,
+                                "currency": game.currency,
+                                "discount_price": game.discount_price,
+                                "platform": game.platform,
+                                "is_nintendo_online": game.is_nintendo_online,
+                                "title": game.title,
+                                "url": f"https://www.nintendo.com/{reg.lower()}/store/products/{game.title_id}"
+                            }
+                            
+                            # Определяем ключ магазина на основе выбранной платформы
+                            store_key = "nintendo"
+                            if "switch2" in store:
+                                store_key = "nintendo_switch2"
+                            
+                            if store_key not in store_region:
+                                store_region[store_key] = {}
+                            store_region[store_key][reg] = nintendo_offer
+                            break  # Берем первую найденную игру
             else:
                 store_region[store][reg] = result
 
@@ -334,6 +405,10 @@ async def show_prices_for_game(
             final_price = offer_data.get("price", float('inf'))
             currency = offer_data.get("currency")
             is_catalog = offer_data.get("included_in_ps_plus", False)
+        elif store_name.startswith('nintendo') and isinstance(offer_data, dict):
+            final_price = offer_data.get("price", float('inf'))
+            currency = offer_data.get("currency")
+            is_catalog = offer_data.get("is_nintendo_online", False)
         elif isinstance(offer_data, list):
             try:
                 offer = offer_data[0]
@@ -360,63 +435,28 @@ async def show_prices_for_game(
         if not offers_by_region:
             lines.append("  <i>Нет предложений</i>")
             return "\n".join(lines)
-
         sorting_prices = {reg: await get_sort_price(store_name, o) for reg, o in offers_by_region.items()}
         sorted_regions = sorted(offers_by_region.items(), key=lambda item: sorting_prices.get(item[0], float('inf')))
-
-        for reg, offers in sorted_regions:
-            if not offers: continue
-            
+        for reg, offer in sorted_regions:
+            if not offer: continue
             flag = REGION_FLAGS.get(reg, "❔")
             price_line_parts = [f"  {flag} <b>{reg}:</b>"]
-            url = ""
-
-            if store_name == 'ps':
-                price_info = offers
-                
-                # Используем региональный ID, если он есть
-                product_id = ps_regional_ids.get(reg, game_ids.get("ps", ""))
-                if product_id.startswith("ps:"):
-                    product_id = product_id[3:]
-                    
-                url = f"https://store.playstation.com/{ps_store._REGION_TO_LOCALE.get(reg, 'en-us')}/product/{product_id}"
-                
-                price, currency = price_info['price'], price_info['currency']
-                old_price, ps_plus_price = price_info.get('old_price'), price_info.get('ps_plus_price')
-                is_included = price_info.get('included_in_ps_plus')
-
-                price_fmt = await fmt_price(price, currency)
-                
-                if is_included:
-                    price_line_parts.append(f'<a href="{url}">Бесплатно в PS Plus</a>')
-                    if price > 0: price_line_parts.append(f'(или {price_fmt})')
-                elif old_price and old_price > price:
-                    old_price_fmt = f"<s>{old_price:g} {CURRENCY_SYMBOLS.get(currency, currency)}</s>"
-                    price_line_parts.append(f'<a href="{url}">{old_price_fmt} {price_fmt}</a>')
-                elif ps_plus_price and ps_plus_price < price:
-                     ps_plus_price_fmt = await fmt_price(ps_plus_price, currency)
-                     price_line_parts.append(f'<a href="{url}">{price_fmt}</a> (PS+: {ps_plus_price_fmt})')
-                else:
-                    price_line_parts.append(f'<a href="{url}">{price_fmt}</a>')
-            else: # Другие магазины
-                try:
-                    offer = offers[0]
-                    label, price, currency, url = offer[0], offer[1], offer[2], offer[3]
-                    discount_val = offer[4] if len(offer) > 4 and offer[4] is not None else None
-                    is_plus = False # Для PC нерелевантно в данном контексте
-                    deposit_flag = False # Аналогично
-                except (ValueError, IndexError):
-                    logger.warning(f"Не удалось распаковать оффер для {store_name}: {offers[0]}")
-                    continue
-                
-                if currency == "FREE": price_line_parts.append(f'<a href="{url}">Бесплатно</a>')
-                elif deposit_flag: price_line_parts.append(f'<a href="{url}">Предзаказ</a> ({await fmt_price(price, currency)})')
-                elif discount_val is not None and discount_val < price:
-                    old_price_fmt = f"<s>{price:g} {currency}</s>"
-                    new_price_fmt = await fmt_price(discount_val, currency)
-                    price_line_parts.append(f'<a href="{url}">{old_price_fmt} {new_price_fmt}</a>')
-                else: price_line_parts.append(f'<a href="{url}">{await fmt_price(price, currency)}</a>')
-            
+            url = offer.get("url", "")
+            price = offer.get("regular")
+            currency = offer.get("currency")
+            discount = offer.get("discount")
+            discount_end = offer.get("discount_end")
+            platform = offer.get("platform", "Switch")
+            title = offer.get("title", "")
+            # Форматируем цену
+            price_fmt = await fmt_price(float(price.replace(',', '.')), currency) if price else "-"
+            # Информация о платформе
+            platform_info = f" ({platform})" if platform else ""
+            if discount:
+                discount_fmt = await fmt_price(float(discount.replace(',', '.')), currency)
+                price_line_parts.append(f'<a href="{url}"><s>{price_fmt}</s> {discount_fmt}{platform_info}</a>')
+            else:
+                price_line_parts.append(f'<a href="{url}">{price_fmt}{platform_info}</a>')
             lines.append(" ".join(price_line_parts))
         return "\n".join(lines)
 
@@ -433,6 +473,9 @@ async def show_prices_for_game(
 
     for store, offers_by_reg in sorted_stores:
         price_details.append(await _render_store_prices(store, offers_by_reg))
+
+    logger.info(f"[DEBUG] Итоговый store_region: {store_region}")
+    logger.info(f"[DEBUG] Итоговый price_details: {price_details}")
 
     msg_text = f"✅ <b>{selected_title}</b>\n\n" + "\n\n".join(price_details)
     msg_text = re.sub(r'\n{3,}', '\n\n', msg_text).strip()
@@ -456,7 +499,7 @@ async def process_search_name(message: types.Message, state: FSMContext):
 
     # Сохраняем исходный запрос для будущего использования в PS Store
     await state.update_data(user_query=message.text)
-    
+
     await message.answer("⏳ Ищу игры во всех магазинах...")
 
     # Дисклеймер о кириллице
@@ -478,6 +521,7 @@ async def process_search_name(message: types.Message, state: FSMContext):
     pc_selected = "pc" in platforms
     xbox_selected = any(p in platforms for p in ("xbox_series", "xbox_one"))
     ps_selected = any(p in platforms for p in ("ps5", "ps4"))
+    nintendo_selected = any(p in platforms for p in ("switch", "switch2"))
 
     if pc_selected:
         tasks.append(steam_store.search_games(message.text))
@@ -499,6 +543,12 @@ async def process_search_name(message: types.Message, state: FSMContext):
         tasks.append(ps_store.search_games(message.text, region=primary_region_for_search))
         store_names.append("ps")
 
+    # Nintendo eShop
+    if nintendo_selected:
+        # Для Nintendo ищем игры без фильтра по платформе, фильтрация будет при получении цен
+        tasks.append(nintendo_eshop_api.nintendo_api.search_games(message.text, 50))
+        store_names.append("nintendo")
+
     if not tasks:
         await message.answer(
             "😔 Пока нет поддерживаемых магазинов для выбранных платформ.",
@@ -514,15 +564,22 @@ async def process_search_name(message: types.Message, state: FSMContext):
             logger.error(f"Поиск в {store_name} завершился ошибкой: {result}")
         else:
             display_name = STORE_DISPLAY.get(store_name, store_name.capitalize())
-            logger.info(f"Найдено {len(result)} игр в {display_name} по запросу '{message.text}'.")
-            # Теперь search_games возвращает (game_id, title, concept_id, invariant_name)
-            for item in result:
-                if len(item) == 4: # PS Store
-                    game_id, title, concept_id, invariant_name = item
-                    all_games.append((store_name, game_id, title, concept_id, invariant_name))
-                else: # Другие магазины
-                    game_id, title = item
-                    all_games.append((store_name, game_id, title, None, None))
+            logger.info(f"Найдено {len(result) if result is not None else 'None'} игр в {display_name} по запросу '{message.text}'.")
+            if store_name == "nintendo":
+                print(f"Nintendo result: {result}")
+                logger.info(f"Nintendo result: {result}")
+                if not result:
+                    logger.warning(f"Nintendo search_games вернул пустой результат для '{message.text}'!")
+                for game in result or []:
+                    all_games.append(("nintendo", game.nsuid, game.title, None, None))
+            else:
+                for item in result:
+                    if len(item) == 4: # PS Store
+                        game_id, title, concept_id, invariant_name = item
+                        all_games.append((store_name, game_id, title, concept_id, invariant_name))
+                    else: # Другие магазины
+                        game_id, title = item
+                        all_games.append((store_name, game_id, title, None, None))
 
     if not all_games:
         await message.answer(
@@ -654,6 +711,7 @@ def group_games_by_title(games: List[Tuple[str, str, str, str | None, str | None
     • одна и та же игра из разных магазинов склеивалась,
     • но отдельные издания (DLC / Deluxe / Bundle / ...) оставались разными кнопками.
     Также сохраняет ps_invariant_name и ps_concept_id для группы.
+    Для Nintendo-игр группировка идёт по NSUID, чтобы не склеивать разные игры с похожими названиями.
     """
     if not games:
         return []
@@ -672,20 +730,20 @@ def group_games_by_title(games: List[Tuple[str, str, str, str | None, str | None
             .replace("©", "")
         )
 
-    groups: Dict[Tuple[frozenset, frozenset], Dict[str, Any]] = {}
+    groups: Dict[Tuple, Dict[str, Any]] = {}
 
     for store, game_id, title, concept_id, invariant_name in games:
         if not title:
             continue
-
         norm = normalize(title)
         tokens = set(norm.replace("-", " ").replace(":", " ").split())
-
         marker_tokens = frozenset(t for t in tokens if t in MARKERS)
         base_tokens = frozenset(t for t in tokens if t not in MARKERS)
-
+        # Для Nintendo-игр ключ группировки включает NSUID (game_id)
+        if store.startswith("nintendo"):
+            key = (base_tokens, marker_tokens, game_id)
+        else:
         key = (base_tokens, marker_tokens)
-
         if key not in groups:
             groups[key] = {"title": title, "ids": {store: game_id}}
             if store == "ps":
@@ -694,18 +752,14 @@ def group_games_by_title(games: List[Tuple[str, str, str, str | None, str | None
                 if concept_id:
                     groups[key]["ps_concept_id"] = concept_id
         else:
-            # При конфликте названий выбираем более длинное (часто полное)
             if len(title) > len(groups[key]["title"]):
                 groups[key]["title"] = title
             groups[key]["ids"].setdefault(store, game_id)
-            # Добавляем инварианты, если их еще нет
             if store == "ps":
                 if invariant_name and "ps_invariant_name" not in groups[key]:
                     groups[key]["ps_invariant_name"] = invariant_name
                 if concept_id and "ps_concept_id" not in groups[key]:
                     groups[key]["ps_concept_id"] = concept_id
-
-    # Приводим к списку
     return sorted(groups.values(), key=lambda x: x["title"].lower()) 
 
 # --- Pagination ---
